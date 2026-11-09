@@ -2,6 +2,10 @@
 // ============================================================================
 // μCore x86_64 Arch — Standalone Limine Boot Protocol Definitions (with SMP!)
 // ============================================================================
+// Adapted for μCore freestanding C++23 from the Limine Boot Protocol specification
+// (https://github.com/limine-bootloader/limine/blob/v8.x/PROTOCOL.md).
+// Limine protocol structures and constants are distributed under 2-Clause BSD / CC0.
+// ============================================================================
 
 #include "mucore/types.hpp"
 

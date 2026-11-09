@@ -411,7 +411,7 @@ extern "C" [[noreturn]] void kmain() noexcept {
 
     SerialCom1::init();
     SerialCom1::puts("\n============================================================\n");
-    SerialCom1::puts("  mucore-kernel (uCore) v0.2.0 — Hybrid SMP FCIS C++23\n");
+    SerialCom1::puts("  mucore-kernel (muCore) v0.2.0 — Hybrid SMP FCIS C++23\n");
     SerialCom1::puts("  Zero Hidden Mechanisms | Per-CPU Shards | VmSpace | CBS-RT\n");
     SerialCom1::puts("============================================================\n");
 

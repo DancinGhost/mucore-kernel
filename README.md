@@ -5,6 +5,7 @@
 [![Language](https://img.shields.io/badge/C%2B%2B-23%20Freestanding-blue.svg)](#the-no-hidden-mechanisms-c23-manifesto)
 [![Architecture](https://img.shields.io/badge/Arch-x86__64%20SMP%20Higher--Half-orange.svg)](#repository-structure)
 [![Paradigm](https://img.shields.io/badge/Architecture-Functional%20Core%20%2F%20Imperative%20Shell-success.svg)](#system-architecture)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
@@ -208,3 +209,15 @@ Summary: 11 passed, 0 failed.
 - [x] **Phase 2 — Hybrid SMP Sharding, 4-Level `VmSpace` & Multi-Core Hardware Bootstrap (Current):** Per-CPU `CpuShard`s, wait-free `SmpMailMatrix` cross-core CBS loans, active-core targeted `PKRU` shootdowns, 4-level `VmSpace` (`W^X` + MPK + `StrictKpti`), 64-frame per-core magazines with Hard-RT watermark, `%gs` `swapgs` + 256-gate IDT + Limine SMP AP bring-up, and 4-OS-thread deterministic SMP replay.
 - [ ] **Phase 3 — Ring-3 Protection Domains & VT-d / AMD-Vi IOMMU:** First Ring-3 Userspace Driver ELF host, dual-mapped `SharedSpscRing` pages, and hardware IOMMU table programming.
 - [ ] **Phase 4 — Native x86_64 Machine-Code Compiler for Kineticlets:** Ahead-of-time lowering of verified `KineticProgram` DAGs to native `x86_64` instructions (< 5 ns Ring-0 execution).
+
+---
+
+## License & Trademark Notice
+
+### License
+This project is open-source software licensed under the [MIT License](LICENSE).
+
+### Trademark Notice & Legal Disclaimers
+All product names, logos, brands, trademarks, and registered trademarks mentioned in this repository (including "Zircon", "Fuchsia", "Windows", "Windows NT", "Plan 9", "L4", "seL4", "Linux", "Limine", "Intel", "AMD", etc.) are the property of their respective owners. Their use in this documentation and codebase is strictly for identification, historical reference, and architectural comparison under nominative fair use.
+
+μCore (`mucore-kernel`) is an independent, clean-room software project written from scratch and is not affiliated with, endorsed by, or sponsored by Google, Microsoft, Bell Labs, the seL4 Foundation, or any other trademark holders. μCore is likewise distinct and independent from the educational Tsinghua `ucore` operating system.
