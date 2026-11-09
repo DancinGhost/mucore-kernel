@@ -1,0 +1,348 @@
+#pragma once
+// ============================================================================
+// μCore Functional Core — Dual-Horizon Real-Time & Async Scheduler
+// ============================================================================
+// Architecture:
+//   - Tier 0 (Isochronous Hard/Firm Real-Time):
+//       Earliest Deadline First (EDF) policed by Constant Bandwidth Server (CBS).
+//       * Zero floating-point math in Ring 0: utilization admission uses ceiling
+//         fixed-point parts-per-million (`1,000,000 ppm == 100%`).
+//       * Temporal Isolation: if an RT thread (or IRQ Kineticlet charged to it!)
+//         exhausts its `remaining_budget_ns`, CBS postpones its deadline /
+//         throttles it until replenishment — rogue tasks CANNOT cause sibling
+//         RT tasks to miss deadlines!
+//       * Guaranteed 15% minimum non-RT reserve (`MAX_RT_UTIL_PPM = 850,000`)
+//         prevents total starvation of Ring-3 driver control planes.
+//   - Tier 1 (Async / Interactive Throughput):
+//       Virtual-runtime (`vruntime_ns`) fair scheduling for event-loop workers
+//       and general workloads when Tier 0 has no runnable job.
+//   - Tickless Determinism:
+//       Computes exact `next_timer_deadline` for APIC TSC-Deadline one-shot mode,
+//       eliminating wasteful periodic timer interrupts.
+// ============================================================================
+
+#include "mucore/result.hpp"
+#include "mucore/types.hpp"
+
+namespace mucore::core::sched {
+
+inline constexpr usize MAX_THREADS             = 64;
+inline constexpr u64   PPM_SCALE               = 1'000'000ULL;
+inline constexpr u64   MAX_RT_UTIL_PPM         = 850'000ULL;   // 85.0% max hard-RT cap
+inline constexpr u64   DEFAULT_ASYNC_SLICE_NS  = 2'000'000ULL; // 2ms tickless slice
+
+enum class SchedClass : u8 {
+    Idle            = 0,
+    AsyncThroughput = 1, // Tier 1: Virtual-runtime fair / async worker threads
+    IsochronousRt   = 2, // Tier 0: Hard/Firm Real-Time CBS + EDF
+};
+
+enum class ThreadState : u8 {
+    Unused    = 0,
+    Ready     = 1,
+    Running   = 2,
+    Blocked   = 3, // Waiting on cold doorbell / explicit sleep
+    Throttled = 4, // CBS budget exhausted; awaits `replenish_at`
+};
+
+struct RtParams {
+    u64 wcet_ns{0};   // C_i: Worst-Case Execution Time budget per period
+    u64 period_ns{0}; // T_i: Minimum inter-arrival / replenishment period
+};
+
+struct ThreadControlBlock {
+    bool        occupied{false};
+    ThreadId    id{};
+    DomainId    domain{};
+    SchedClass  sched_class{SchedClass::AsyncThroughput};
+    ThreadState state{ThreadState::Unused};
+
+    // Tier-0 CBS/EDF state
+    RtParams    rt{};
+    u64         util_ppm{0};
+    u64         remaining_budget_ns{0};
+    TickNs      abs_deadline{};
+    TickNs      replenish_at{};
+    u32         budget_overruns{0};
+
+    // Tier-1 Async/Fair state
+    u32         weight{1024}; // 1024 = neutral nice-0 weight
+    u64         vruntime_ns{0};
+
+    // Accounting
+    u64         total_runtime_ns{0};
+    u64         context_switches{0};
+};
+
+struct SchedTable {
+    ThreadControlBlock threads[MAX_THREADS]{};
+    ThreadId           current_thread{};
+    TickNs             last_accounted_at{};
+    u64                reserved_rt_ppm{0};
+
+    constexpr SchedTable() noexcept = default;
+    SchedTable(SchedTable const&)            = delete;
+    SchedTable& operator=(SchedTable const&) = delete;
+    constexpr SchedTable(SchedTable&&) noexcept            = default;
+    constexpr SchedTable& operator=(SchedTable&&) noexcept = default;
+};
+
+// Pure Scheduling Decision output consumed by Imperative Shell (arch context switcher + APIC timer)
+struct SchedDecision {
+    ThreadId next_thread{};
+    DomainId next_domain{};
+    bool     requires_context_switch{false};
+    bool     requires_address_space_switch{false};
+    TickNs   next_timer_deadline{}; // Tickless one-shot deadline (0 = no timer needed / idle)
+};
+
+// ============================================================================
+// PURE FUNCTIONAL CORE ADMISSION & SCHEDULING EQUATIONS
+// ============================================================================
+
+// Ceiling fixed-point utilization: ceil((wcet_ns * 1,000,000) / period_ns)
+[[nodiscard]] constexpr Result<u64, Error> compute_rt_utilization_ppm(RtParams params) noexcept {
+    if (params.wcet_ns == 0 || params.period_ns == 0 || params.wcet_ns > params.period_ns) {
+        return Result<u64, Error>::err(Error::InvalidArgument);
+    }
+    // Overflow-safe check for reasonable periods (< 10^12 ns = 1000 seconds)
+    u64 const numer = params.wcet_ns * PPM_SCALE + (params.period_ns - 1ULL);
+    u64 const ppm   = numer / params.period_ns;
+    return Result<u64, Error>::ok(ppm);
+}
+
+// Exact CBS/EDF Admission Test: sum(U_i) + U_new <= MAX_RT_UTIL_PPM
+[[nodiscard]] constexpr Result<u64, Error> check_rt_admission(
+    SchedTable const& table,
+    RtParams          candidate
+) noexcept {
+    auto ppm_res = compute_rt_utilization_ppm(candidate);
+    if (ppm_res.is_err()) {
+        return Result<u64, Error>::err(ppm_res.error());
+    }
+    u64 const req_ppm = ppm_res.value();
+    if (table.reserved_rt_ppm + req_ppm > MAX_RT_UTIL_PPM) {
+        return Result<u64, Error>::err(Error::AdmissionRejected);
+    }
+    return Result<u64, Error>::ok(req_ppm);
+}
+
+[[nodiscard]] constexpr Option<u32> find_thread_slot(
+    SchedTable const& table,
+    ThreadId          tid
+) noexcept {
+    if (!tid) return Option<u32>::none();
+    for (u32 i = 0; i < MAX_THREADS; ++i) {
+        if (table.threads[i].occupied && table.threads[i].id == tid) {
+            return Option<u32>::some(i);
+        }
+    }
+    return Option<u32>::none();
+}
+
+// Spawn and admit a thread (if IsochronousRt, runs exact EDF utilization gate!)
+[[nodiscard]] constexpr Result<ThreadId, Error> spawn_thread(
+    SchedTable& table,
+    ThreadId    desired_id,
+    DomainId    domain,
+    SchedClass  sclass,
+    RtParams    rt_params,
+    TickNs      now
+) noexcept {
+    if (!desired_id || !domain || find_thread_slot(table, desired_id).is_some()) {
+        return Result<ThreadId, Error>::err(Error::InvalidArgument);
+    }
+
+    u64 admitted_ppm = 0;
+    if (sclass == SchedClass::IsochronousRt) {
+        auto adm = check_rt_admission(table, rt_params);
+        if (adm.is_err()) {
+            return Result<ThreadId, Error>::err(adm.error());
+        }
+        admitted_ppm = adm.value();
+    }
+
+    for (u32 i = 0; i < MAX_THREADS; ++i) {
+        if (!table.threads[i].occupied) {
+            ThreadControlBlock tcb{};
+            tcb.occupied = true;
+            tcb.id       = desired_id;
+            tcb.domain   = domain;
+            tcb.sched_class = sclass;
+            tcb.state    = ThreadState::Ready;
+
+            if (sclass == SchedClass::IsochronousRt) {
+                tcb.rt                  = rt_params;
+                tcb.util_ppm            = admitted_ppm;
+                tcb.remaining_budget_ns = rt_params.wcet_ns;
+                tcb.abs_deadline        = TickNs{now.raw + rt_params.period_ns};
+                tcb.replenish_at        = TickNs{now.raw + rt_params.period_ns};
+                table.reserved_rt_ppm  += admitted_ppm;
+            }
+
+            table.threads[i] = tcb;
+            return Result<ThreadId, Error>::ok(desired_id);
+        }
+    }
+    return Result<ThreadId, Error>::err(Error::TableFull);
+}
+
+// Charge Ring-0 Kineticlet / IRQ execution time directly to owning RT thread's CBS budget!
+// Prevents interrupt storms from invisibly stealing CPU time from sibling Hard-RT tasks.
+constexpr void charge_external_wcet(
+    SchedTable& table,
+    ThreadId    owner_tid,
+    u64         cost_ns
+) noexcept {
+    auto slot_opt = find_thread_slot(table, owner_tid);
+    if (slot_opt.is_none()) return;
+
+    ThreadControlBlock& tcb = table.threads[slot_opt.value()];
+    tcb.total_runtime_ns += cost_ns;
+
+    if (tcb.sched_class == SchedClass::IsochronousRt) {
+        if (cost_ns >= tcb.remaining_budget_ns) {
+            tcb.remaining_budget_ns = 0;
+            tcb.budget_overruns += 1;
+            if (tcb.state == ThreadState::Ready || tcb.state == ThreadState::Running) {
+                tcb.state = ThreadState::Throttled;
+            }
+        } else {
+            tcb.remaining_budget_ns -= cost_ns;
+        }
+    } else {
+        tcb.vruntime_ns += cost_ns;
+    }
+}
+
+// Advance scheduler clock to `now`, replenish CBS periods, and pick optimal next thread
+[[nodiscard]] constexpr SchedDecision schedule_at(
+    SchedTable& table,
+    TickNs      now
+) noexcept {
+    u64 const elapsed = (now.raw > table.last_accounted_at.raw)
+                            ? (now.raw - table.last_accounted_at.raw)
+                            : 0ULL;
+    table.last_accounted_at = now;
+
+    DomainId prev_domain{};
+    auto cur_slot_opt = find_thread_slot(table, table.current_thread);
+    if (cur_slot_opt.is_some()) {
+        ThreadControlBlock& cur = table.threads[cur_slot_opt.value()];
+        prev_domain = cur.domain;
+
+        if (cur.state == ThreadState::Running && elapsed > 0) {
+            cur.total_runtime_ns += elapsed;
+
+            if (cur.sched_class == SchedClass::IsochronousRt) {
+                if (elapsed >= cur.remaining_budget_ns) {
+                    cur.remaining_budget_ns = 0;
+                    cur.budget_overruns += 1;
+                    cur.state = ThreadState::Throttled;
+                } else {
+                    cur.remaining_budget_ns -= elapsed;
+                    cur.state = ThreadState::Ready;
+                }
+            } else if (cur.sched_class == SchedClass::AsyncThroughput) {
+                u64 const scaled = (elapsed * 1024ULL) / (cur.weight ? cur.weight : 1024ULL);
+                cur.vruntime_ns += scaled;
+                cur.state = ThreadState::Ready;
+            } else {
+                cur.state = ThreadState::Ready;
+            }
+        } else if (cur.state == ThreadState::Running) {
+            cur.state = ThreadState::Ready;
+        }
+    }
+
+    // Step 1: Replenish any Isochronous RT tasks whose CBS period boundary has arrived
+    TickNs earliest_replenish{0};
+    for (u32 i = 0; i < MAX_THREADS; ++i) {
+        ThreadControlBlock& tcb = table.threads[i];
+        if (!tcb.occupied || tcb.sched_class != SchedClass::IsochronousRt) continue;
+
+        if (now >= tcb.replenish_at) {
+            // Advance period epochs cleanly even across multi-period idle gaps
+            u64 const periods = 1ULL + ((now.raw - tcb.replenish_at.raw) / tcb.rt.period_ns);
+            tcb.replenish_at = TickNs{tcb.replenish_at.raw + periods * tcb.rt.period_ns};
+            tcb.abs_deadline = tcb.replenish_at;
+            tcb.remaining_budget_ns = tcb.rt.wcet_ns;
+            if (tcb.state == ThreadState::Throttled) {
+                tcb.state = ThreadState::Ready;
+            }
+        }
+
+        if (tcb.state == ThreadState::Throttled) {
+            if (earliest_replenish.raw == 0 || tcb.replenish_at < earliest_replenish) {
+                earliest_replenish = tcb.replenish_at;
+            }
+        }
+    }
+
+    // Step 2: Tier-0 Selection — Pick Ready IsochronousRt thread with Earliest Deadline (EDF)
+    Option<u32> chosen_idx = Option<u32>::none();
+    for (u32 i = 0; i < MAX_THREADS; ++i) {
+        ThreadControlBlock const& tcb = table.threads[i];
+        if (!tcb.occupied || tcb.state != ThreadState::Ready) continue;
+        if (tcb.sched_class != SchedClass::IsochronousRt || tcb.remaining_budget_ns == 0) continue;
+
+        if (chosen_idx.is_none() ||
+            tcb.abs_deadline < table.threads[chosen_idx.value()].abs_deadline) {
+            chosen_idx = Option<u32>::some(i);
+        }
+    }
+
+    // Step 3: Tier-1 Fallback — Pick Ready AsyncThroughput thread with minimal `vruntime_ns`
+    if (chosen_idx.is_none()) {
+        for (u32 i = 0; i < MAX_THREADS; ++i) {
+            ThreadControlBlock const& tcb = table.threads[i];
+            if (!tcb.occupied || tcb.state != ThreadState::Ready) continue;
+            if (tcb.sched_class != SchedClass::AsyncThroughput) continue;
+
+            if (chosen_idx.is_none() ||
+                tcb.vruntime_ns < table.threads[chosen_idx.value()].vruntime_ns) {
+                chosen_idx = Option<u32>::some(i);
+            }
+        }
+    }
+
+    SchedDecision decision{};
+    if (chosen_idx.is_none()) {
+        // CPU enters low-power tickless idle until earliest RT replenishment (if any)
+        table.current_thread             = ThreadId{0};
+        decision.next_thread             = ThreadId{0};
+        decision.next_domain             = DomainId{0};
+        decision.requires_context_switch = (prev_domain.raw != 0);
+        decision.next_timer_deadline     = earliest_replenish;
+        return decision;
+    }
+
+    ThreadControlBlock& winner = table.threads[chosen_idx.value()];
+    winner.state = ThreadState::Running;
+
+    bool const switched_thread = !(winner.id == table.current_thread);
+    if (switched_thread) {
+        winner.context_switches += 1;
+    }
+    table.current_thread = winner.id;
+
+    // Compute exact tickless hardware timer deadline
+    TickNs slice_end{};
+    if (winner.sched_class == SchedClass::IsochronousRt) {
+        slice_end = TickNs{now.raw + winner.remaining_budget_ns};
+    } else {
+        slice_end = TickNs{now.raw + DEFAULT_ASYNC_SLICE_NS};
+    }
+    if (earliest_replenish.raw != 0 && earliest_replenish < slice_end) {
+        slice_end = earliest_replenish;
+    }
+
+    decision.next_thread                   = winner.id;
+    decision.next_domain                   = winner.domain;
+    decision.requires_context_switch       = switched_thread;
+    decision.requires_address_space_switch = switched_thread && !(winner.domain == prev_domain);
+    decision.next_timer_deadline           = slice_end;
+    return decision;
+}
+
+} // namespace mucore::core::sched

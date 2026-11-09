@@ -1,0 +1,15 @@
+# Build artifacts
+build/
+*.o
+*.d
+*.elf
+*.iso
+*.bin
+*.sym
+
+# Editor / IDE files
+.vscode/
+.clangd/
+compile_commands.json
+*~
+.DS_Store
