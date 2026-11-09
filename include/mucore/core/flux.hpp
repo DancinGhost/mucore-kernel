@@ -73,6 +73,9 @@ struct ConduitState {
     ConduitId      id{};
     DomainId       producer{};
     DomainId       consumer{};
+    ThreadId       consumer_worker{};  // Optional worker thread for L4-MCS CBS donation!
+    PortId         bound_port{};       // Optional Zircon/NT O(1) readiness aggregator!
+    u8             port_bind_slot{0};
     KineticId      attached_kinetic{}; // Optional Ring-0 Kineticlet fast-path hook!
 
     // Wait-Free SPSC ring indices (monotonic wrapping u32; occupancy = head - tail)

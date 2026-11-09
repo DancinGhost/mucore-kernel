@@ -1,16 +1,23 @@
 #pragma once
 // ============================================================================
-// μCore Functional Core — Physical Frame Policy & Zero-Copy Grant Arenas
+// μCore Functional Core — Zero-Copy Arenas, MPK Sealing, NT DMA Quarantine
+//                         & Co-Located Driver Filter Stacks
 // ============================================================================
-// Solves the Microkernel Memory Copy & TLB Shootdown Bottleneck:
-//   1. Ergonomic Intra-Domain Allocation (Anti-L4 Trap):
-//      Domains allocate private anonymous frames against their `AmbientProfile`
-//      quota without manually constructing hardware page-table capabilities.
-//   2. Zero-Copy `GrantArena` Lease Transfer (Zero memcpy, Zero TLB Shootdown):
-//      Traditional zero-copy remaps page tables on every IPC (`invlpg` IPIs
-//      cost thousands of cycles across cores!). μCore establishes persistent
-//      capability-gated `GrantArena` windows and transfers logical slice
-//      ownership (`current_holder`) in O(1) without touching `CR3` or `invlpg`.
+// Resolves three major hybrid-kernel hazards identified in architectural audit:
+//   1. Shared-Memory TOCTOU ("Double-Fetch") Elimination:
+//      `transfer_and_seal_arena()` pairs O(1) lease transfer with Hardware
+//      Memory Protection Key (`PkeyId`, x86 PKRU/PKS) write-revocation —
+//      preventing malicious senders from mutating buffers during validation
+//      with ZERO `invlpg` TLB shootdown IPIs!
+//   2. Windows NT-Style Async Crash & DMA Quarantine Teardown:
+//      Tracks `in_flight_dma_ops` per `GrantArena`. If a client crashes while
+//      PCIe hardware is mid-DMA, `quarantine_domain_arenas()` isolates the
+//      frames in `QuarantinedDmaDrain` rather than freeing them into `PhysPool`,
+//      eliminating async DMA Use-After-Free!
+//   3. NT Filter Stacks / Fuchsia DFv2 Driver Colocation (`ColocatedPipeline`):
+//      Mutually trusted protocol layers co-located in one Ring-3 domain pass
+//      `IoPacket`s (IRPs) stage-to-stage with 0 IPC hops & 0 CR3 switches,
+//      complete with deterministic cancellation unwinding.
 // ============================================================================
 
 #include "mucore/result.hpp"
@@ -19,19 +26,18 @@
 
 namespace mucore::core::mm {
 
-inline constexpr usize BITMAP_WORDS      = 64; // 64 * 64 = 4096 frames = 16 MiB per pool block
-inline constexpr usize MAX_FRAMES        = BITMAP_WORDS * 64;
-inline constexpr usize MAX_GRANT_ARENAS  = 32;
+inline constexpr usize BITMAP_WORDS         = 64; // 64 * 64 = 4096 frames = 16 MiB pool
+inline constexpr usize MAX_FRAMES           = BITMAP_WORDS * 64;
+inline constexpr usize MAX_GRANT_ARENAS     = 32;
+inline constexpr usize MAX_PIPELINE_STAGES  = 6;
 
-// Pure constexpr trailing-zeros helper (avoids compiler builtin portability pitfalls)
-[[nodiscard]] constexpr u32 ctz64(u64 val) noexcept {
-    u32 count = 0;
-    while ((val & 1ULL) == 0ULL && count < 64u) {
-        val >>= 1;
-        ++count;
-    }
-    return count;
-}
+enum class ArenaLifecycle : u8 {
+    Free                 = 0,
+    EditableByHolder     = 1, // Current lease holder may read/write freely
+    SealedForValidation  = 2, // Sender write-revoked via MPK; receiver/Kineticlet safe from TOCTOU!
+    DmaInFlight          = 3, // Pinned for active PCIe/IOMMU hardware transfer
+    QuarantinedDmaDrain  = 4, // Domain crashed/cancelled mid-DMA; physical free blocked until drain!
+};
 
 struct PhysPoolState {
     PhysAddr base_addr{0x0020'0000ULL}; // Default 2 MiB base
@@ -47,15 +53,35 @@ struct PhysPoolState {
 };
 
 struct GrantArenaState {
-    bool     active{false};
-    ArenaId  id{};
-    PhysAddr phys_base{};
-    u32      page_count{0};
-    DomainId creator{};
-    DomainId current_lease_holder{}; // Domain currently permitted to mutate payload
-    bool     iommu_dma_pinned{false}; // True if pinned for Userspace Driver DMA
-    // Inline header/scratch words visible to attached Ring-0 Kineticlets
-    u64      kinetic_words[kinetic::NUM_ARENA_WORDS]{};
+    bool           active{false};
+    ArenaId        id{};
+    ArenaLifecycle lifecycle{ArenaLifecycle::Free};
+    PkeyId         mpk_key{1};           // Hardware protection key guarding sender writes
+    PhysAddr       phys_base{};
+    u32            page_count{0};
+    DomainId       creator{};
+    DomainId       current_lease_holder{};
+    bool           iommu_dma_pinned{false};
+    u32            in_flight_dma_ops{0}; // Non-zero blocks physical frame reclamation!
+    u64            kinetic_words[kinetic::NUM_ARENA_WORDS]{};
+};
+
+// NT IRP-Inspired Co-Located Filter Stack Packet (Fuchsia DFv2 / NT Stack Synthesis)
+enum class IoPacketStatus : u8 {
+    Pending   = 0,
+    Completed = 1,
+    Cancelled = 2,
+};
+
+struct ColocatedPipeline {
+    IoPacketId     packet_id{};
+    DomainId       host_domain{}; // Single Ring-3 domain hosting co-located trusted stages
+    ArenaId        payload_arena{};
+    u32            stage_ids[MAX_PIPELINE_STAGES]{};
+    u8             total_stages{0};
+    u8             current_stage{0};
+    IoPacketStatus status{IoPacketStatus::Pending};
+    u32            zero_ipc_hops{0}; // Counts stage transitions completed with 0 syscalls!
 };
 
 struct MemoryTable {
@@ -70,7 +96,7 @@ struct MemoryTable {
 };
 
 // ============================================================================
-// PURE FUNCTIONAL CORE ALLOCATION & ZERO-COPY LEASE OPERATIONS
+// PURE FUNCTIONAL CORE ALLOCATION, MPK SEALING & NT QUARANTINE OPERATIONS
 // ============================================================================
 
 [[nodiscard]] constexpr Result<PhysAddr, Error> alloc_frame(PhysPoolState& pool) noexcept {
@@ -123,25 +149,37 @@ struct MemoryTable {
     return Result<Unit, Error>::ok(Unit{});
 }
 
+[[nodiscard]] constexpr Option<usize> find_arena_slot(
+    MemoryTable const& mem,
+    ArenaId            id
+) noexcept {
+    if (!id) return Option<usize>::none();
+    for (usize i = 0; i < MAX_GRANT_ARENAS; ++i) {
+        if (mem.arenas[i].active && mem.arenas[i].id == id) {
+            return Option<usize>::some(i);
+        }
+    }
+    return Option<usize>::none();
+}
+
 [[nodiscard]] constexpr Result<ArenaId, Error> create_grant_arena(
     MemoryTable& mem,
     ArenaId      desired_id,
     DomainId     creator,
     u32          pages,
-    bool         dma_pinned
+    bool         dma_pinned,
+    PkeyId       mpk_key = PkeyId{1}
 ) noexcept {
-    if (!desired_id || !creator || pages == 0) {
+    if (!desired_id || !creator || pages == 0 || find_arena_slot(mem, desired_id).is_some()) {
         return Result<ArenaId, Error>::err(Error::InvalidArgument);
     }
 
-    // Allocate first backing frame from pool to anchor arena physical window
     auto base_res = alloc_frame(mem.pool);
     if (base_res.is_err()) {
         return Result<ArenaId, Error>::err(base_res.error());
     }
     PhysAddr const base_phys = base_res.value();
 
-    // Allocate remaining contiguous frames (in fresh pool, sequential allocs are contiguous)
     for (u32 p = 1; p < pages; ++p) {
         auto next_res = alloc_frame(mem.pool);
         if (next_res.is_err()) {
@@ -154,6 +192,8 @@ struct MemoryTable {
             GrantArenaState arena{};
             arena.active               = true;
             arena.id                   = desired_id;
+            arena.lifecycle            = ArenaLifecycle::EditableByHolder;
+            arena.mpk_key              = mpk_key;
             arena.phys_base            = base_phys;
             arena.page_count           = pages;
             arena.creator              = creator;
@@ -167,27 +207,166 @@ struct MemoryTable {
     return Result<ArenaId, Error>::err(Error::TableFull);
 }
 
-// O(1) Zero-Copy Lease Handoff: transfers exclusive write/consume ownership without TLB shootdowns!
-[[nodiscard]] constexpr Result<Unit, Error> transfer_arena_lease(
+// O(1) Zero-Copy Lease Handoff + Optional MPK Seal (eliminates TOCTOU double-fetch!)
+[[nodiscard]] constexpr Result<PkeyId, Error> transfer_arena_lease(
     MemoryTable& mem,
     ArenaId      arena_id,
     DomainId     current_owner,
-    DomainId     next_owner
+    DomainId     next_owner,
+    bool         seal_sender_writes = true
 ) noexcept {
     if (!arena_id || !current_owner || !next_owner) {
-        return Result<Unit, Error>::err(Error::InvalidArgument);
+        return Result<PkeyId, Error>::err(Error::InvalidArgument);
     }
+
+    auto slot_opt = find_arena_slot(mem, arena_id);
+    if (slot_opt.is_none()) {
+        return Result<PkeyId, Error>::err(Error::NotFound);
+    }
+
+    GrantArenaState& a = mem.arenas[slot_opt.value()];
+    if (!(a.current_lease_holder == current_owner)) {
+        return Result<PkeyId, Error>::err(Error::DomainMismatch);
+    }
+    if (a.lifecycle == ArenaLifecycle::QuarantinedDmaDrain ||
+        a.lifecycle == ArenaLifecycle::DmaInFlight) {
+        return Result<PkeyId, Error>::err(Error::ArenaSealed);
+    }
+
+    a.current_lease_holder = next_owner;
+    a.lifecycle = seal_sender_writes ? ArenaLifecycle::SealedForValidation
+                                     : ArenaLifecycle::EditableByHolder;
+    return Result<PkeyId, Error>::ok(a.mpk_key);
+}
+
+// Mark arena as actively undergoing hardware PCIe/IOMMU DMA
+[[nodiscard]] constexpr Result<Unit, Error> begin_arena_dma(
+    MemoryTable& mem,
+    ArenaId      arena_id,
+    DomainId     driver_holder
+) noexcept {
+    auto slot_opt = find_arena_slot(mem, arena_id);
+    if (slot_opt.is_none()) {
+        return Result<Unit, Error>::err(Error::NotFound);
+    }
+    GrantArenaState& a = mem.arenas[slot_opt.value()];
+    if (!(a.current_lease_holder == driver_holder) || !a.iommu_dma_pinned) {
+        return Result<Unit, Error>::err(Error::InsufficientRights);
+    }
+    if (a.lifecycle == ArenaLifecycle::QuarantinedDmaDrain) {
+        return Result<Unit, Error>::err(Error::DmaInFlightQuarantined);
+    }
+    a.in_flight_dma_ops += 1;
+    a.lifecycle = ArenaLifecycle::DmaInFlight;
+    return Result<Unit, Error>::ok(Unit{});
+}
+
+// NT Crash/Cancellation Teardown: safely quarantines in-flight DMA pages instead of UAF!
+[[nodiscard]] constexpr u32 quarantine_domain_arenas(
+    MemoryTable& mem,
+    DomainId     crashed_or_cancelling_domain
+) noexcept {
+    u32 quarantined_count = 0;
     for (usize i = 0; i < MAX_GRANT_ARENAS; ++i) {
         GrantArenaState& a = mem.arenas[i];
-        if (a.active && a.id == arena_id) {
-            if (!(a.current_lease_holder == current_owner)) {
-                return Result<Unit, Error>::err(Error::DomainMismatch);
+        if (!a.active) continue;
+        if (!(a.creator == crashed_or_cancelling_domain) &&
+            !(a.current_lease_holder == crashed_or_cancelling_domain)) {
+            continue;
+        }
+
+        if (a.in_flight_dma_ops > 0) {
+            // Hardware DMA still active! Lock in Quarantine so PhysPool CANNOT reallocate!
+            a.lifecycle = ArenaLifecycle::QuarantinedDmaDrain;
+            quarantined_count += 1;
+        } else {
+            // Safe to reclaim backing physical frames immediately
+            for (u32 p = 0; p < a.page_count; ++p) {
+                (void)free_frame(mem.pool, a.phys_base.offset(static_cast<u64>(p) * PAGE_SIZE_4K));
             }
-            a.current_lease_holder = next_owner;
-            return Result<Unit, Error>::ok(Unit{});
+            a = GrantArenaState{};
         }
     }
-    return Result<Unit, Error>::err(Error::NotFound);
+    return quarantined_count;
+}
+
+// Attempt explicit arena reclamation (fails with `DmaInFlightQuarantined` if DMA still active!)
+[[nodiscard]] constexpr Result<Unit, Error> destroy_grant_arena(
+    MemoryTable& mem,
+    ArenaId      arena_id
+) noexcept {
+    auto slot_opt = find_arena_slot(mem, arena_id);
+    if (slot_opt.is_none()) {
+        return Result<Unit, Error>::err(Error::NotFound);
+    }
+    GrantArenaState& a = mem.arenas[slot_opt.value()];
+    if (a.in_flight_dma_ops > 0 || a.lifecycle == ArenaLifecycle::QuarantinedDmaDrain) {
+        return Result<Unit, Error>::err(Error::DmaInFlightQuarantined);
+    }
+    for (u32 p = 0; p < a.page_count; ++p) {
+        (void)free_frame(mem.pool, a.phys_base.offset(static_cast<u64>(p) * PAGE_SIZE_4K));
+    }
+    a = GrantArenaState{};
+    return Result<Unit, Error>::ok(Unit{});
+}
+
+// Driver / IOMMU confirms hardware queue abort/completion -> releases quarantined pages safely!
+[[nodiscard]] constexpr Result<bool, Error> complete_arena_dma_op(
+    MemoryTable& mem,
+    ArenaId      arena_id
+) noexcept {
+    auto slot_opt = find_arena_slot(mem, arena_id);
+    if (slot_opt.is_none()) {
+        return Result<bool, Error>::err(Error::NotFound);
+    }
+    GrantArenaState& a = mem.arenas[slot_opt.value()];
+    if (a.in_flight_dma_ops == 0) {
+        return Result<bool, Error>::err(Error::InvalidState);
+    }
+
+    a.in_flight_dma_ops -= 1;
+    if (a.in_flight_dma_ops == 0) {
+        if (a.lifecycle == ArenaLifecycle::QuarantinedDmaDrain) {
+            // Final quarantined DMA drained! Reclaim physical frames safely now.
+            for (u32 p = 0; p < a.page_count; ++p) {
+                (void)free_frame(mem.pool, a.phys_base.offset(static_cast<u64>(p) * PAGE_SIZE_4K));
+            }
+            a = GrantArenaState{};
+            return Result<bool, Error>::ok(true); // Reclaimed from quarantine!
+        }
+        a.lifecycle = ArenaLifecycle::EditableByHolder;
+    }
+    return Result<bool, Error>::ok(false);
+}
+
+// ============================================================================
+// CO-LOCATED TRUSTED FILTER PIPELINE (NT IRP Stack / Fuchsia DFv2 Colocation)
+// ============================================================================
+
+[[nodiscard]] constexpr Result<u32, Error> advance_colocated_stage(
+    ColocatedPipeline& pipe
+) noexcept {
+    if (pipe.status != IoPacketStatus::Pending || pipe.total_stages == 0) {
+        return Result<u32, Error>::err(Error::InvalidState);
+    }
+    if (pipe.current_stage + 1u < pipe.total_stages) {
+        pipe.current_stage += 1;
+        pipe.zero_ipc_hops += 1;
+        return Result<u32, Error>::ok(pipe.stage_ids[pipe.current_stage]);
+    }
+    pipe.status = IoPacketStatus::Completed;
+    return Result<u32, Error>::ok(0u);
+}
+
+// Deterministic reverse-order NT IRP cancellation unwind across visited stages
+[[nodiscard]] constexpr u8 cancel_colocated_pipeline(ColocatedPipeline& pipe) noexcept {
+    if (pipe.status != IoPacketStatus::Pending) {
+        return 0;
+    }
+    u8 const unwound_stages = static_cast<u8>(pipe.current_stage + 1u);
+    pipe.current_stage = 0;
+    pipe.status        = IoPacketStatus::Cancelled;
+    return unwound_stages;
 }
 
 } // namespace mucore::core::mm

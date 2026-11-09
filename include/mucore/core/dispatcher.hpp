@@ -1,15 +1,14 @@
 #pragma once
 // ============================================================================
-// μCore Functional Core — Top-Level Deterministic Kernel State Machine
+// μCore Functional Core — Top-Level Deterministic Kernel State Machine (v2)
 // ============================================================================
-// Unifies Capability Security, Dual-Horizon CBS/EDF + Async Scheduling,
-// Zero-Copy Grant Arenas, Flux Wait-Free Conduits, and Ring-0 Kineticlets
-// behind a single pure state transition boundary:
-//
-//   dispatch_event(KernelState&, KernelEvent const&) -> Result<EffectBatch>
-//
-// Zero inline assembly. Zero hardware registers. Zero locks.
-// 100% deterministic, replayable, and host/constexpr testable!
+// Unifies the Four-Lineage Hybrid Synthesis behind a Pure Functional Core:
+//   - Zircon: `FluxPort` O(1) multi-conduit readiness & zero ambient VFS.
+//   - Windows NT: MPK `GrantArena` TOCTOU sealing, IOMMU DMA crash quarantine,
+//                 and co-located zero-IPC filter pipelines.
+//   - Plan 9: Per-domain capability namespaces (`NamespaceTable`) with union
+//             mount interposition ("Plan 9 Cold, Zero-Switch Hot").
+//   - L4 MCS: Asynchronous CBS deadline & budget donation over Urgent Flux.
 // ============================================================================
 
 #include "mucore/core/capability.hpp"
@@ -17,39 +16,43 @@
 #include "mucore/core/flux.hpp"
 #include "mucore/core/kinetic.hpp"
 #include "mucore/core/memory.hpp"
+#include "mucore/core/namespace_p9.hpp"
+#include "mucore/core/port.hpp"
 #include "mucore/core/scheduler.hpp"
 
 namespace mucore::core {
 
-inline constexpr usize MAX_CONDUITS      = 16;
+inline constexpr usize MAX_CONDUITS      = 32;
 inline constexpr usize MAX_KINETIC_SLOTS = 16;
 inline constexpr usize MAX_IRQ_BINDINGS  = 16;
 
-// Split-Plane Driver Pact: binds a hardware IRQ to a Ring-3 Userspace Driver
-// control plane AND an optional verified Ring-0 Kineticlet data-plane fast path!
 struct IrqPactBinding {
     bool      active{false};
     IrqLine   irq{};
-    DomainId  driver_domain{};    // Ring-3 isolated Userspace Driver
-    ThreadId  driver_thread{};    // Charged for Ring-0 Kineticlet CBS WCET!
-    ThreadId  urgent_wake_thread{}; // Optional Hard-RT client thread woken on `WakeUrgentRt`
-    ConduitId conduit{};          // Shared async completion ring
-    KineticId fast_kinetic{};     // Optional Ring-0 Kineticlet fast-path hook
-    ArenaId   shared_arena{};     // Optional zero-copy GrantArena window
+    DomainId  driver_domain{};
+    ThreadId  driver_thread{};
+    ThreadId  urgent_wake_thread{};
+    ConduitId conduit{};
+    KineticId fast_kinetic{};
+    ArenaId   shared_arena{};
 };
 
 struct KernelTelemetry {
     u64 total_events{0};
-    u64 ring0_fast_handled{0};     // Completed in Ring 0 with ZERO context switches!
-    u64 ring3_escalations{0};      // Uncommon/error paths delegated to Ring 3
+    u64 ring0_fast_handled{0};
+    u64 ring3_escalations{0};
     u64 context_switches_emitted{0};
     u64 cr3_switches_emitted{0};
+    u64 mcs_donations{0};
+    u64 dma_quarantines{0};
 };
 
 struct KernelState {
     cap::CapTable             caps{};
     sched::SchedTable         sched{};
     mm::MemoryTable           mem{};
+    ns::NamespaceTable        namespaces{};
+    port::FluxPortState       ports[port::MAX_PORTS]{};
     flux::ConduitState        conduits[MAX_CONDUITS]{};
     kinetic::KineticSlotState kinetics[MAX_KINETIC_SLOTS]{};
     IrqPactBinding            irq_pacts[MAX_IRQ_BINDINGS]{};
@@ -79,6 +82,19 @@ struct KernelState {
     return Option<usize>::none();
 }
 
+[[nodiscard]] constexpr Option<usize> find_port_idx(
+    KernelState const& state,
+    PortId             id
+) noexcept {
+    if (!id) return Option<usize>::none();
+    for (usize i = 0; i < port::MAX_PORTS; ++i) {
+        if (state.ports[i].active && state.ports[i].id == id) {
+            return Option<usize>::some(i);
+        }
+    }
+    return Option<usize>::none();
+}
+
 [[nodiscard]] constexpr Option<usize> find_kinetic_idx(
     KernelState const& state,
     KineticId          id
@@ -92,26 +108,13 @@ struct KernelState {
     return Option<usize>::none();
 }
 
-[[nodiscard]] constexpr Option<usize> find_arena_idx(
-    KernelState const& state,
-    ArenaId            id
-) noexcept {
-    if (!id) return Option<usize>::none();
-    for (usize i = 0; i < mm::MAX_GRANT_ARENAS; ++i) {
-        if (state.mem.arenas[i].active && state.mem.arenas[i].id == id) {
-            return Option<usize>::some(i);
-        }
-    }
-    return Option<usize>::none();
-}
-
-// Open a capability-backed Flux Conduit between `producer` and `consumer`
 [[nodiscard]] constexpr Result<ConduitId, Error> open_conduit(
     KernelState& state,
     ConduitId    desired_id,
     DomainId     producer,
     DomainId     consumer,
-    bool         pinned_hot = false
+    bool         pinned_hot      = false,
+    ThreadId     consumer_worker = ThreadId{0}
 ) noexcept {
     if (!desired_id || !producer || !consumer || find_conduit_idx(state, desired_id).is_some()) {
         return Result<ConduitId, Error>::err(Error::InvalidArgument);
@@ -119,12 +122,13 @@ struct KernelState {
     for (usize i = 0; i < MAX_CONDUITS; ++i) {
         if (!state.conduits[i].active) {
             flux::ConduitState c{};
-            c.active     = true;
-            c.id         = desired_id;
-            c.producer   = producer;
-            c.consumer   = consumer;
-            c.pinned_hot = pinned_hot;
-            c.thermal    = pinned_hot ? flux::ThermalState::Hot : flux::ThermalState::Cold;
+            c.active          = true;
+            c.id              = desired_id;
+            c.producer        = producer;
+            c.consumer        = consumer;
+            c.consumer_worker = consumer_worker;
+            c.pinned_hot      = pinned_hot;
+            c.thermal         = pinned_hot ? flux::ThermalState::Hot : flux::ThermalState::Cold;
             state.conduits[i] = c;
             return Result<ConduitId, Error>::ok(desired_id);
         }
@@ -132,12 +136,58 @@ struct KernelState {
     return Result<ConduitId, Error>::err(Error::TableFull);
 }
 
-// Verify and install a Ring-0 Kineticlet fast-path gated by `kinetic_cap`
+// Create a Zircon/NT-style O(1) readiness aggregator port
+[[nodiscard]] constexpr Result<PortId, Error> create_flux_port(
+    KernelState& state,
+    PortId       desired_id,
+    DomainId     owner,
+    ThreadId     server_thread = ThreadId{0}
+) noexcept {
+    if (!desired_id || !owner || find_port_idx(state, desired_id).is_some()) {
+        return Result<PortId, Error>::err(Error::InvalidArgument);
+    }
+    for (usize i = 0; i < port::MAX_PORTS; ++i) {
+        if (!state.ports[i].active) {
+            port::FluxPortState p{};
+            p.active                = true;
+            p.id                    = desired_id;
+            p.owner                 = owner;
+            p.waiting_server_thread = server_thread;
+            state.ports[i]          = p;
+            return Result<PortId, Error>::ok(desired_id);
+        }
+    }
+    return Result<PortId, Error>::err(Error::TableFull);
+}
+
+// Bind a `FluxConduit` into a `FluxPort` so server polls 1 port in O(1) instead of N rings
+[[nodiscard]] constexpr Result<Unit, Error> attach_conduit_to_port(
+    KernelState& state,
+    ConduitId    conduit_id,
+    PortId       port_id,
+    u64          user_key
+) noexcept {
+    auto c_idx = find_conduit_idx(state, conduit_id);
+    auto p_idx = find_port_idx(state, port_id);
+    if (c_idx.is_none() || p_idx.is_none()) {
+        return Result<Unit, Error>::err(Error::NotFound);
+    }
+
+    auto slot_res = port::bind_conduit_to_port(state.ports[p_idx.value()], conduit_id, user_key);
+    if (slot_res.is_err()) {
+        return Result<Unit, Error>::err(slot_res.error());
+    }
+
+    state.conduits[c_idx.value()].bound_port     = port_id;
+    state.conduits[c_idx.value()].port_bind_slot = slot_res.value();
+    return Result<Unit, Error>::ok(Unit{});
+}
+
 [[nodiscard]] constexpr Result<kinetic::VerifyReport, Error> install_kineticlet(
-    KernelState&                 state,
-    DomainId                     caller,
-    cap::CapToken                kinetic_cap,
-    KineticId                    desired_id,
+    KernelState&                   state,
+    DomainId                       caller,
+    cap::CapToken                  kinetic_cap,
+    KineticId                      desired_id,
     kinetic::KineticProgram const& program
 ) noexcept {
     if (!desired_id || find_kinetic_idx(state, desired_id).is_some()) {
@@ -155,7 +205,6 @@ struct KernelState {
         return Result<kinetic::VerifyReport, Error>::err(cap_res.error());
     }
 
-    // Run static DAG verifier (proves termination, memory bounds, rights & exact WCET!)
     auto proof_res = kinetic::verify_program(program, cap_res.value().rights);
     if (proof_res.is_err()) {
         return Result<kinetic::VerifyReport, Error>::err(proof_res.error());
@@ -164,11 +213,11 @@ struct KernelState {
     for (usize i = 0; i < MAX_KINETIC_SLOTS; ++i) {
         if (!state.kinetics[i].installed) {
             kinetic::KineticSlotState slot{};
-            slot.installed = true;
-            slot.id        = desired_id;
-            slot.owner     = caller;
-            slot.program   = program;
-            slot.proof     = proof_res.value();
+            slot.installed    = true;
+            slot.id           = desired_id;
+            slot.owner        = caller;
+            slot.program      = program;
+            slot.proof        = proof_res.value();
             state.kinetics[i] = slot;
             return Result<kinetic::VerifyReport, Error>::ok(slot.proof);
         }
@@ -176,7 +225,6 @@ struct KernelState {
     return Result<kinetic::VerifyReport, Error>::err(Error::TableFull);
 }
 
-// Bind a Split-Plane Userspace Driver + Optional Ring-0 Kineticlet to a Hardware IRQ
 [[nodiscard]] constexpr Result<Unit, Error> bind_irq_pact(
     KernelState&          state,
     DomainId              driver_domain,
@@ -207,10 +255,9 @@ struct KernelState {
     return Result<Unit, Error>::err(Error::TableFull);
 }
 
-// Helper: Append scheduler effects into `EffectBatch`
 constexpr void append_sched_effects(
-    KernelState&               state,
-    EffectBatch&               effects,
+    KernelState&                state,
+    EffectBatch&                effects,
     sched::SchedDecision const& dec
 ) noexcept {
     if (dec.requires_address_space_switch && dec.next_domain) {
@@ -280,13 +327,12 @@ constexpr void append_sched_effects(
             IrqPactBinding const& pact = state.irq_pacts[pact_idx.value()];
             auto kin_idx = find_kinetic_idx(state, pact.fast_kinetic);
 
-            // Fast Path: Verified Ring-0 Kineticlet grafted onto this IRQ!
             if (kin_idx.is_some()) {
                 kinetic::KineticSlotState& kslot = state.kinetics[kin_idx.value()];
                 kslot.invocations += 1;
 
                 u64* arena_ptr = nullptr;
-                auto ar_idx = find_arena_idx(state, pact.shared_arena);
+                auto ar_idx = mm::find_arena_slot(state.mem, pact.shared_arena);
                 if (ar_idx.is_some()) {
                     arena_ptr = state.mem.arenas[ar_idx.value()].kinetic_words;
                 }
@@ -310,7 +356,6 @@ constexpr void append_sched_effects(
                     kslot.persistent_state[s] = kout.next_state[s];
                 }
 
-                // Charge exact verified WCET to owning driver thread's CBS budget!
                 sched::charge_external_wcet(state.sched, pact.driver_thread, kslot.proof.wcet_ns);
 
                 switch (kout.verdict) {
@@ -334,7 +379,6 @@ constexpr void append_sched_effects(
                             }
                         }
 
-                        // Handled 100% in Ring 0 — ZERO context switch, ZERO CR3 switch!
                         (void)effects.push(KernelEffect{
                             .kind        = EffectKind::AckIrqFastPath,
                             .irq_line    = pact.irq,
@@ -367,11 +411,10 @@ constexpr void append_sched_effects(
 
                     case kinetic::ReturnVerdict::EscalateToUserspace:
                         kslot.escalations += 1;
-                        break; // Fall through to Ring-3 Userspace Driver escalation!
+                        break;
                 }
             }
 
-            // Cold / Error Path: Escalate safely to isolated Ring-3 Userspace Driver!
             state.telemetry.ring3_escalations += 1;
             auto drv_slot = sched::find_thread_slot(state.sched, pact.driver_thread);
             if (drv_slot.is_some()) {
@@ -395,7 +438,7 @@ constexpr void append_sched_effects(
         }
 
         // --------------------------------------------------------------------
-        // 3. Flux Async Conduit Submission (Capability-Gated + Thermal Tiered)
+        // 3. Flux Async Conduit Submission (MPK Seal + Port O(1) + L4 MCS Loan!)
         // --------------------------------------------------------------------
         case EventKind::FluxSubmit: {
             u16 req_rights = cap::CapRights::Write;
@@ -422,14 +465,33 @@ constexpr void append_sched_effects(
 
             flux::ConduitState& conduit = state.conduits[c_idx.value()];
 
-            // If Conduit has an attached Ring-0 Kineticlet, intercept synchronously in Ring 0!
+            // If zero-copy GrantArena attached, transfer lease & MPK-seal sender writes!
+            if (ev.submission.grant_arena) {
+                auto seal_res = mm::transfer_arena_lease(
+                    state.mem,
+                    ev.submission.grant_arena,
+                    ev.caller_domain,
+                    conduit.consumer,
+                    true
+                );
+                if (seal_res.is_err()) {
+                    return Result<EffectBatch, Error>::err(seal_res.error());
+                }
+                (void)effects.push(KernelEffect{
+                    .kind          = EffectKind::UpdateProtectionKey,
+                    .target_domain = ev.caller_domain,
+                    .mpk_key       = seal_res.value(),
+                });
+            }
+
+            // Optional Ring-0 Kineticlet synchronous fast-path interception
             auto kin_idx = find_kinetic_idx(state, conduit.attached_kinetic);
             if (kin_idx.is_some() && !ev.urgent_rt) {
                 kinetic::KineticSlotState& kslot = state.kinetics[kin_idx.value()];
                 kslot.invocations += 1;
 
                 u64* arena_ptr = nullptr;
-                auto ar_idx = find_arena_idx(state, ev.submission.grant_arena);
+                auto ar_idx = mm::find_arena_slot(state.mem, ev.submission.grant_arena);
                 if (ar_idx.is_some()) {
                     arena_ptr = state.mem.arenas[ar_idx.value()].kinetic_words;
                 }
@@ -471,9 +533,28 @@ constexpr void append_sched_effects(
                 return Result<EffectBatch, Error>::err(sub_res.error());
             }
 
+            // Signal Zircon/NT O(1) `FluxPort` aggregator if bound!
+            if (conduit.bound_port) {
+                auto p_idx = find_port_idx(state, conduit.bound_port);
+                if (p_idx.is_some()) {
+                    (void)port::signal_port_slot(
+                        state.ports[p_idx.value()], conduit.port_bind_slot, ev.urgent_rt
+                    );
+                }
+            }
+
+            // L4-MCS Scheduling Context Donation on Urgent-RT calls!
+            if (ev.urgent_rt && ev.caller_thread && conduit.consumer_worker) {
+                auto loan_res = sched::donate_cbs_context(
+                    state.sched, ev.caller_thread, conduit.consumer_worker
+                );
+                if (loan_res.is_ok()) {
+                    state.telemetry.mcs_donations += 1;
+                }
+            }
+
             flux::SubmitOutcome const& outcome = sub_res.value();
             if (outcome.doorbell == flux::DoorbellAction::None) {
-                // Hot tier! Receiver is already polling shared memory — 0 doorbell trap!
                 conduit.zero_switch_fast_ops += 1;
                 state.telemetry.ring0_fast_handled += 1;
             } else {
@@ -493,7 +574,33 @@ constexpr void append_sched_effects(
         }
 
         // --------------------------------------------------------------------
-        // 4. Periodic Thermal Sweep (Demotes Idle Hot Conduits -> Warm -> Cold)
+        // 4. Flux Completion + L4-MCS Borrowed CBS Context Return!
+        // --------------------------------------------------------------------
+        case EventKind::FluxComplete: {
+            auto c_idx = find_conduit_idx(state, ev.conduit_id);
+            if (c_idx.is_none()) {
+                return Result<EffectBatch, Error>::err(Error::NotFound);
+            }
+
+            auto comp_res = flux::enqueue_completion(state.conduits[c_idx.value()], ev.completion);
+            if (comp_res.is_err()) {
+                return Result<EffectBatch, Error>::err(comp_res.error());
+            }
+
+            if (ev.caller_thread) {
+                // Account elapsed worker runtime BEFORE returning leftover CBS budget to donor!
+                (void)sched::schedule_at(state.sched, ev.timestamp);
+                auto ret_res = sched::return_cbs_context(state.sched, ev.caller_thread);
+                if (ret_res.is_ok()) {
+                    auto dec = sched::schedule_at(state.sched, ev.timestamp);
+                    append_sched_effects(state, effects, dec);
+                }
+            }
+            return Result<EffectBatch, Error>::ok(mucore::move(effects));
+        }
+
+        // --------------------------------------------------------------------
+        // 5. Periodic Thermal Sweep (Demotes Idle Hot Conduits -> Warm -> Cold)
         // --------------------------------------------------------------------
         case EventKind::ThermalSweep: {
             for (usize i = 0; i < MAX_CONDUITS; ++i) {
@@ -505,7 +612,7 @@ constexpr void append_sched_effects(
         }
 
         // --------------------------------------------------------------------
-        // 5. O(1) Epoch Lineage Revocation
+        // 6. O(1) Epoch Lineage Revocation
         // --------------------------------------------------------------------
         case EventKind::RevokeCapability: {
             auto mut_res = cap::plan_revoke_lineage(
@@ -515,6 +622,22 @@ constexpr void append_sched_effects(
                 return Result<EffectBatch, Error>::err(mut_res.error());
             }
             cap::apply_mutation(state.caps, mut_res.value());
+            return Result<EffectBatch, Error>::ok(mucore::move(effects));
+        }
+
+        // --------------------------------------------------------------------
+        // 7. NT-Style Crash Teardown & IOMMU DMA Quarantine
+        // --------------------------------------------------------------------
+        case EventKind::DomainCrashTeardown: {
+            u32 const quarantined = mm::quarantine_domain_arenas(state.mem, ev.caller_domain);
+            if (quarantined > 0) {
+                state.telemetry.dma_quarantines += quarantined;
+                (void)effects.push(KernelEffect{
+                    .kind          = EffectKind::QuarantineIommuDomain,
+                    .target_domain = ev.caller_domain,
+                    .fast_result   = quarantined,
+                });
+            }
             return Result<EffectBatch, Error>::ok(mucore::move(effects));
         }
     }

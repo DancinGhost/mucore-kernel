@@ -1,22 +1,20 @@
 #pragma once
 // ============================================================================
-// μCore Functional Core — Pragmatic Generational Capability Engine
+// μCore Functional Core — Pragmatic Generational Capability Engine (v2)
 // ============================================================================
-// Architectural Innovations:
-//   1. Anti-L4 Ergonomics ("Ambient Inside, Capabilities Between"):
-//      Intra-domain operations (anonymous heap/stack VM, local threads, futex)
-//      are governed by lightweight `AmbientProfile` quotas rather than forcing
-//      processes to juggle capabilities for every 4KiB page table level.
-//      Capabilities are reserved for cross-domain Conduits, zero-copy Grants,
-//      Userspace Driver MMIO/IRQ/DMA, Real-Time Budgets, and Ring-0 Kineticlets.
-//   2. O(1) Real-Time Transitive Revocation via `RevocationGroupId` Epochs:
-//      Traditional microkernels walk a Capability Derivation Tree (O(N) latency
-//      spikes that break Hard Real-Time!). μCore binds derived capability
-//      lineages to an epoch counter: bumping `group_epochs[group]` invalidates
-//      all transitive delegates in exact O(1) Worst-Case Execution Time.
-//   3. Pure Functional Core:
-//      Validation and derivation take `CapTable const&` and return explicit
-//      `CapMutation` values — zero hidden mutation, 100% constexpr-verifiable.
+// Synthesizes Zircon, L4, and Real-Time Capability Design:
+//   1. Zircon Discipline (Zero Confused-Deputy Dual Authority):
+//      `AmbientProfile` is strictly restricted to *intra-domain* private RAM,
+//      local threads, and futexes — NO ambient global VFS back-door! External
+//      resources are 100% capability-governed (composed via Plan-9 per-domain
+//      namespaces in `namespace_p9.hpp`).
+//   2. Dual-Granularity O(1) Revocation + Zero Zombie Slot Leakage:
+//      - Surgical `plan_revoke_single`: O(1) generation bump on one slot
+//        (zero collateral blast radius to sibling delegates!).
+//      - Subtree `plan_revoke_lineage`: O(1) `RevocationGroupId` epoch bump
+//        invalidating an entire delegation tree in 1 integer increment.
+//      - Automatic Lazy Reclamation: slots with stale `bound_epoch` are
+//        transparently recycled on allocation with incremented `generation`.
 // ============================================================================
 
 #include "mucore/result.hpp"
@@ -30,12 +28,13 @@ inline constexpr usize MAX_REVOCATION_GROUPS = 64;
 enum class CapObjectKind : u8 {
     None          = 0,
     FluxConduit   = 1, // Wait-free async Ring0/Ring3 or Driver IPC channel
-    GrantArena    = 2, // Zero-copy shared physical memory window
-    MmioRegion    = 3, // Device BAR / MMIO physical frame range (Userspace Drivers)
-    IrqHook       = 4, // Hardware interrupt line binding
-    KineticSlot   = 5, // Authority to graft a verified Kineticlet into Ring 0
-    RtBudget      = 6, // Authority to reserve Isochronous CBS/EDF CPU bandwidth
-    DomainControl = 7, // Authority to spawn or supervise a child ProtectionDomain
+    FluxPort      = 2, // Zircon/NT-style O(1) multi-conduit readiness multiplexer
+    GrantArena    = 3, // Zero-copy shared physical memory window (with MPK/DMA guard)
+    MmioRegion    = 4, // Device BAR / MMIO physical frame range (Userspace Drivers)
+    IrqHook       = 5, // Hardware interrupt line binding
+    KineticSlot   = 6, // Authority to graft a verified Kineticlet into Ring 0
+    RtBudget      = 7, // L4-MCS authority to reserve & donate CBS/EDF CPU bandwidth
+    DomainControl = 8, // Authority to spawn or supervise a child ProtectionDomain
 };
 
 namespace CapRights {
@@ -44,12 +43,13 @@ namespace CapRights {
     inline constexpr u16 Write        = 1u << 1;
     inline constexpr u16 ExecuteRing0 = 1u << 2; // Install/trigger Ring-0 fast-path
     inline constexpr u16 Delegate     = 1u << 3; // Derive attenuated child caps
-    inline constexpr u16 Revoke       = 1u << 4; // Advance lineage revocation epoch
-    inline constexpr u16 UrgentRt     = 1u << 5; // Push to out-of-band RT priority slot
+    inline constexpr u16 Revoke       = 1u << 4; // Revoke single slot or lineage epoch
+    inline constexpr u16 UrgentRt     = 1u << 5; // Push Urgent RT + donate CBS context
     inline constexpr u16 DmaMap       = 1u << 6; // Program IOMMU DMA mappings
+    inline constexpr u16 FastPromote  = 1u << 7; // Upgrade Plan-9 path to Hot zero-switch ring
 
     inline constexpr u16 All =
-        Read | Write | ExecuteRing0 | Delegate | Revoke | UrgentRt | DmaMap;
+        Read | Write | ExecuteRing0 | Delegate | Revoke | UrgentRt | DmaMap | FastPromote;
 } // namespace CapRights
 
 struct RevocationGroupId {
@@ -62,6 +62,7 @@ struct CapToken {
     u64 raw{0};
 
     constexpr bool operator==(CapToken const&) const noexcept = default;
+    constexpr explicit operator bool() const noexcept { return raw != 0; }
 
     [[nodiscard]] static constexpr CapToken pack(
         u32 slot_idx, u32 generation, CapObjectKind kind, u16 rights_hint
@@ -84,12 +85,11 @@ struct CapToken {
     }
 };
 
-// Ambient intra-domain ergonomics (avoids L4 "everything is a capability" pain)
+// Strictly Local Intra-Domain Quotas (Zero ambient external authority!)
 struct AmbientProfile {
-    u32  quota_anon_pages{1024}; // Max private 4KiB pages without explicit Frame caps
+    u32  quota_anon_pages{1024}; // Max private 4KiB pages without L4 frame-cap plumbing
     u16  max_local_threads{16};
     bool allow_local_futex{true};
-    bool allow_cold_syscall_vfs{true};
 };
 
 // Authoritative Ring-0 Capability Slot Entry
@@ -100,8 +100,8 @@ struct CapEntry {
     CapObjectKind     kind{CapObjectKind::None};
     u16               rights{CapRights::None};
     RevocationGroupId rev_group{};
-    u32               bound_epoch{0}; // Valid iff == table.group_epochs[rev_group]
-    u64               object_id{0};   // Target ConduitId / ArenaId / PhysAddr / IrqLine
+    u32               bound_epoch{0}; // Live iff == table.group_epochs[rev_group]
+    u64               object_id{0};   // Target ConduitId / PortId / ArenaId / IrqLine
 };
 
 // Explicit State Mutation emitted by Pure Core functions
@@ -133,12 +133,21 @@ struct CapTable {
 };
 
 // ============================================================================
-// PURE FUNCTIONAL CORE OPERATIONS (Zero Side Effects, O(1) Deterministic WCET)
+// PURE FUNCTIONAL CORE OPERATIONS (Zero Side Effects, Deterministic Bounds)
 // ============================================================================
 
+[[nodiscard]] constexpr bool is_slot_live(CapTable const& table, u32 idx) noexcept {
+    if (idx == 0 || idx >= MAX_CAP_SLOTS) return false;
+    CapEntry const& e = table.slots[idx];
+    if (!e.occupied) return false;
+    if (e.rev_group.raw >= MAX_REVOCATION_GROUPS) return false;
+    return table.group_epochs[e.rev_group.raw] == e.bound_epoch;
+}
+
+// Reclaims both unoccupied slots AND epoch-expired zombie slots automatically!
 [[nodiscard]] constexpr Option<u32> find_free_slot(CapTable const& table) noexcept {
     for (u32 i = 1; i < MAX_CAP_SLOTS; ++i) { // Slot 0 reserved as null sentinel
-        if (!table.slots[i].occupied) {
+        if (!is_slot_live(table, i)) {
             return Option<u32>::some(i);
         }
     }
@@ -223,10 +232,7 @@ struct CapTable {
     return Result<CapMutation, Error>::ok(mut);
 }
 
-// Plan capability delegation with strict Monotonic Rights Attenuation:
-//   - Caller must own `parent_token` and possess `CapRights::Delegate`.
-//   - `attenuated_rights` MUST be a non-empty subset of `parent.rights` (cannot amplify!).
-//   - Child inherits parent's `RevocationGroupId` + `bound_epoch` for O(1) revocation.
+// Plan capability delegation with strict Monotonic Rights Attenuation
 [[nodiscard]] constexpr Result<CapMutation, Error> plan_delegate_attenuated(
     CapTable const& table,
     DomainId        caller,
@@ -278,7 +284,33 @@ struct CapTable {
     return Result<CapMutation, Error>::ok(mut);
 }
 
-// O(1) Transitive Lineage Revocation: requires `CapRights::Revoke` on the lineage
+// Surgical O(1) Single-Delegate Revocation (zero collateral blast radius to siblings!)
+[[nodiscard]] constexpr Result<CapMutation, Error> plan_revoke_single(
+    CapTable const& table,
+    DomainId        caller,
+    CapToken        revoke_authority_token,
+    u32             target_slot_idx
+) noexcept {
+    auto valid_res = validate_capability(
+        table, caller, revoke_authority_token, CapObjectKind::None, CapRights::Revoke
+    );
+    if (valid_res.is_err()) {
+        return Result<CapMutation, Error>::err(valid_res.error());
+    }
+    if (!is_slot_live(table, target_slot_idx)) {
+        return Result<CapMutation, Error>::err(Error::NotFound);
+    }
+    if (!(table.slots[target_slot_idx].rev_group == valid_res.value().rev_group)) {
+        return Result<CapMutation, Error>::err(Error::InsufficientRights);
+    }
+
+    CapMutation mut{};
+    mut.type     = CapMutation::Type::ClearSlot;
+    mut.slot_idx = target_slot_idx;
+    return Result<CapMutation, Error>::ok(mut);
+}
+
+// Emergency O(1) Transitive Lineage Revocation: invalidates entire group in 1 increment!
 [[nodiscard]] constexpr Result<CapMutation, Error> plan_revoke_lineage(
     CapTable const& table,
     DomainId        caller,

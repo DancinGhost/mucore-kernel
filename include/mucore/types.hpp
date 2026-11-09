@@ -54,6 +54,12 @@ struct ConduitId {
     constexpr explicit operator bool() const noexcept { return raw != 0; }
 };
 
+struct PortId {
+    u32 raw{0};
+    constexpr bool operator==(PortId const&) const noexcept = default;
+    constexpr explicit operator bool() const noexcept { return raw != 0; }
+};
+
 struct ArenaId {
     u32 raw{0};
     constexpr bool operator==(ArenaId const&) const noexcept = default;
@@ -63,6 +69,18 @@ struct ArenaId {
 struct KineticId {
     u32 raw{0};
     constexpr bool operator==(KineticId const&) const noexcept = default;
+    constexpr explicit operator bool() const noexcept { return raw != 0; }
+};
+
+// Hardware Memory Protection Key (x86_64 PKRU / PKS 4-bit key 0..15)
+struct PkeyId {
+    u8 raw{0};
+    constexpr bool operator==(PkeyId const&) const noexcept = default;
+};
+
+struct IoPacketId {
+    u64 raw{0};
+    constexpr bool operator==(IoPacketId const&) const noexcept = default;
     constexpr explicit operator bool() const noexcept { return raw != 0; }
 };
 
@@ -95,6 +113,25 @@ struct TickNs {
     constexpr bool operator>=(TickNs const& o) const noexcept { return raw >= o.raw; }
 };
 
+// Pure constexpr trailing-zeros bit scan (used for O(1) bitmaps in Port & Memory)
+[[nodiscard]] constexpr u32 ctz64(u64 val) noexcept {
+    u32 count = 0;
+    while ((val & 1ULL) == 0ULL && count < 64u) {
+        val >>= 1;
+        ++count;
+    }
+    return count;
+}
+
+// Branchless Spectre-v1 speculative index mask (exact for all 64-bit `idx`, zero branches):
+// Produces `idx` when `idx < bound_pow2`, and `0` when `idx >= bound_pow2` using pure ALU shifts.
+[[nodiscard]] constexpr u64 nospec_index_pow2(u64 idx, u64 bound_pow2) noexcept {
+    u64 const mask = static_cast<u64>(
+        static_cast<i64>(~(idx | (bound_pow2 - 1ULL - idx))) >> 63
+    );
+    return idx & (bound_pow2 - 1ULL) & mask;
+}
+
 // ----------------------------------------------------------------------------
 // Explicit Kernel Error Taxonomy (Replaces C++ Exceptions Completely)
 // ----------------------------------------------------------------------------
@@ -107,36 +144,44 @@ enum class Error : u8 {
     DomainMismatch,
     TableFull,
     QuotaExceeded,
-    AdmissionRejected,     // Real-Time CBS/EDF utilization bound exceeded
-    VerificationFailed,    // Ring-0 Kineticlet static proof rejected program
-    StepBudgetExceeded,    // Ring-0 Kineticlet fuel exhausted
+    AdmissionRejected,       // Real-Time CBS/EDF utilization bound exceeded
+    VerificationFailed,      // Ring-0 Kineticlet static proof rejected program
+    StepBudgetExceeded,      // Ring-0 Kineticlet fuel exhausted
     RingFull,
     RingEmpty,
     OutOfBounds,
     OutOfMemory,
     NotFound,
     InvalidState,
+    ArenaSealed,             // Sender write blocked while GrantArena is sealed (anti-TOCTOU)
+    DmaInFlightQuarantined,  // Physical frames quarantined until hardware/IOMMU DMA drains
+    NamespaceNotFound,       // Plan-9 per-domain mount table lookup missed
+    LoanActive,              // L4 MCS CBS scheduling context already loaned out
 };
 
 [[nodiscard]] constexpr const char* error_name(Error err) noexcept {
     switch (err) {
-        case Error::None:               return "None";
-        case Error::InvalidArgument:    return "InvalidArgument";
-        case Error::InvalidCapability:  return "InvalidCapability";
-        case Error::RevokedCapability:  return "RevokedCapability";
-        case Error::InsufficientRights: return "InsufficientRights";
-        case Error::DomainMismatch:     return "DomainMismatch";
-        case Error::TableFull:          return "TableFull";
-        case Error::QuotaExceeded:      return "QuotaExceeded";
-        case Error::AdmissionRejected:  return "AdmissionRejected";
-        case Error::VerificationFailed: return "VerificationFailed";
-        case Error::StepBudgetExceeded: return "StepBudgetExceeded";
-        case Error::RingFull:           return "RingFull";
-        case Error::RingEmpty:          return "RingEmpty";
-        case Error::OutOfBounds:        return "OutOfBounds";
-        case Error::OutOfMemory:        return "OutOfMemory";
-        case Error::NotFound:           return "NotFound";
-        case Error::InvalidState:       return "InvalidState";
+        case Error::None:                   return "None";
+        case Error::InvalidArgument:        return "InvalidArgument";
+        case Error::InvalidCapability:      return "InvalidCapability";
+        case Error::RevokedCapability:      return "RevokedCapability";
+        case Error::InsufficientRights:     return "InsufficientRights";
+        case Error::DomainMismatch:         return "DomainMismatch";
+        case Error::TableFull:              return "TableFull";
+        case Error::QuotaExceeded:          return "QuotaExceeded";
+        case Error::AdmissionRejected:      return "AdmissionRejected";
+        case Error::VerificationFailed:     return "VerificationFailed";
+        case Error::StepBudgetExceeded:     return "StepBudgetExceeded";
+        case Error::RingFull:               return "RingFull";
+        case Error::RingEmpty:              return "RingEmpty";
+        case Error::OutOfBounds:            return "OutOfBounds";
+        case Error::OutOfMemory:            return "OutOfMemory";
+        case Error::NotFound:               return "NotFound";
+        case Error::InvalidState:           return "InvalidState";
+        case Error::ArenaSealed:            return "ArenaSealed";
+        case Error::DmaInFlightQuarantined: return "DmaInFlightQuarantined";
+        case Error::NamespaceNotFound:      return "NamespaceNotFound";
+        case Error::LoanActive:             return "LoanActive";
     }
     return "UnknownError";
 }

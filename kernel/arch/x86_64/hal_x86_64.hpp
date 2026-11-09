@@ -77,12 +77,24 @@ public:
         doorbells_ += 1;
     }
 
+    void update_protection_key(DomainId /*domain*/, PkeyId pkey) noexcept {
+        mpk_seals_ += 1;
+        if (hardware_live_ && pku_supported_) {
+            write_pkru_seal_writes(pkey);
+        }
+    }
+
+    void quarantine_iommu_domain(DomainId /*domain*/, u64 count) noexcept {
+        iommu_quarantines_ += count;
+    }
+
     [[nodiscard]] u64 fast_eois() const noexcept     { return fast_eois_; }
     [[nodiscard]] u64 ring3_upcalls() const noexcept { return ring3_upcalls_; }
     [[nodiscard]] u64 cr3_reloads() const noexcept   { return cr3_reloads_; }
 
 private:
     bool     hardware_live_{false};
+    bool     pku_supported_{false};
     PhysAddr domain_pml4_phys_[32]{};
     ThreadId active_thread_{};
     TickNs   next_deadline_{};
@@ -93,6 +105,8 @@ private:
     u64      fast_eois_{0};
     u64      ring3_upcalls_{0};
     u64      doorbells_{0};
+    u64      mpk_seals_{0};
+    u64      iommu_quarantines_{0};
 };
 
 // Compile-time static concept verification (Zero vtable, 100% static check!)

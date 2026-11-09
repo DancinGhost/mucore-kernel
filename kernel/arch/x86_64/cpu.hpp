@@ -95,6 +95,20 @@ inline void switch_cr3_pcid(PhysAddr pml4_phys, u16 pcid_12bit, bool preserve_tl
     asm volatile("mov %0, %%cr3" : : "r"(val) : "memory");
 }
 
+// Write x86_64 Protection Key Rights for User Pages (PKRU) in ~20 cycles (0 TLB shootdowns!):
+// Each 4-bit key `k` (0..15) uses 2 bits in PKRU: bit (2*k)=AccessDisable, bit (2*k+1)=WriteDisable.
+inline void write_pkru_seal_writes(PkeyId key) noexcept {
+    u32 const wd_bit = 1u << ((key.raw & 0xFu) * 2u + 1u);
+    asm volatile(
+        "xorl %%ecx, %%ecx\n\t"
+        "xorl %%edx, %%edx\n\t"
+        ".byte 0x0f, 0x01, 0xef" /* architectural wrpkru opcode */
+        :
+        : "a"(wd_bit)
+        : "ecx", "edx", "memory"
+    );
+}
+
 extern "C" void x86_64_load_gdt_and_tss(DescriptorPtr const* gdtr, u16 cs_sel, u16 ds_sel, u16 tss_sel) noexcept;
 extern "C" void x86_64_syscall_entry() noexcept;
 

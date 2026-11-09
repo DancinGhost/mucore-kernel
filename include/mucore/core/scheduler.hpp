@@ -1,24 +1,20 @@
 #pragma once
 // ============================================================================
-// μCore Functional Core — Dual-Horizon Real-Time & Async Scheduler
+// μCore Functional Core — Dual-Horizon Scheduler + L4 MCS Context Donation
 // ============================================================================
 // Architecture:
 //   - Tier 0 (Isochronous Hard/Firm Real-Time):
-//       Earliest Deadline First (EDF) policed by Constant Bandwidth Server (CBS).
-//       * Zero floating-point math in Ring 0: utilization admission uses ceiling
-//         fixed-point parts-per-million (`1,000,000 ppm == 100%`).
-//       * Temporal Isolation: if an RT thread (or IRQ Kineticlet charged to it!)
-//         exhausts its `remaining_budget_ns`, CBS postpones its deadline /
-//         throttles it until replenishment — rogue tasks CANNOT cause sibling
-//         RT tasks to miss deadlines!
-//       * Guaranteed 15% minimum non-RT reserve (`MAX_RT_UTIL_PPM = 850,000`)
-//         prevents total starvation of Ring-3 driver control planes.
+//       Earliest Deadline First (EDF) policed by Constant Bandwidth Server (CBS)
+//       with ceiling fixed-point utilization (`MAX_RT_UTIL_PPM = 850,000`).
 //   - Tier 1 (Async / Interactive Throughput):
-//       Virtual-runtime (`vruntime_ns`) fair scheduling for event-loop workers
-//       and general workloads when Tier 0 has no runnable job.
-//   - Tickless Determinism:
-//       Computes exact `next_timer_deadline` for APIC TSC-Deadline one-shot mode,
-//       eliminating wasteful periodic timer interrupts.
+//       Weighted virtual-runtime (`vruntime_ns`) fair scheduling.
+//   - L4-MCS Scheduling Context Donation Over Async Conduits:
+//       Solves asynchronous priority inversion! When an Urgent-RT client thread
+//       submits work to a Userspace Driver / Server worker (even a Tier-1 non-RT
+//       worker or throttled driver!), `donate_cbs_context()` atomically loans
+//       the client's `abs_deadline` and `remaining_budget_ns` to the worker.
+//       Total system CBS budget is strictly conserved (zero double-spending!),
+//       and `return_cbs_context()` restores leftover budget on completion.
 // ============================================================================
 
 #include "mucore/result.hpp"
@@ -41,7 +37,7 @@ enum class ThreadState : u8 {
     Unused    = 0,
     Ready     = 1,
     Running   = 2,
-    Blocked   = 3, // Waiting on cold doorbell / explicit sleep
+    Blocked   = 3, // Waiting on cold doorbell / explicit sleep / loaned RT call
     Throttled = 4, // CBS budget exhausted; awaits `replenish_at`
 };
 
@@ -65,8 +61,15 @@ struct ThreadControlBlock {
     TickNs      replenish_at{};
     u32         budget_overruns{0};
 
+    // L4-MCS Scheduling Context Loan tracking (strict conservation of CBS budget!)
+    ThreadId    loaned_to{};        // Non-zero while this RT thread's budget is loaned out
+    ThreadId    borrowed_from{};    // Non-zero while executing on a client's CBS loan
+    SchedClass  saved_class{SchedClass::AsyncThroughput};
+    u64         saved_budget_ns{0};
+    TickNs      saved_deadline{};
+
     // Tier-1 Async/Fair state
-    u32         weight{1024}; // 1024 = neutral nice-0 weight
+    u32         weight{1024};
     u64         vruntime_ns{0};
 
     // Accounting
@@ -87,31 +90,27 @@ struct SchedTable {
     constexpr SchedTable& operator=(SchedTable&&) noexcept = default;
 };
 
-// Pure Scheduling Decision output consumed by Imperative Shell (arch context switcher + APIC timer)
 struct SchedDecision {
     ThreadId next_thread{};
     DomainId next_domain{};
     bool     requires_context_switch{false};
     bool     requires_address_space_switch{false};
-    TickNs   next_timer_deadline{}; // Tickless one-shot deadline (0 = no timer needed / idle)
+    TickNs   next_timer_deadline{};
 };
 
 // ============================================================================
-// PURE FUNCTIONAL CORE ADMISSION & SCHEDULING EQUATIONS
+// PURE FUNCTIONAL CORE ADMISSION, MCS DONATION & SCHEDULING EQUATIONS
 // ============================================================================
 
-// Ceiling fixed-point utilization: ceil((wcet_ns * 1,000,000) / period_ns)
 [[nodiscard]] constexpr Result<u64, Error> compute_rt_utilization_ppm(RtParams params) noexcept {
     if (params.wcet_ns == 0 || params.period_ns == 0 || params.wcet_ns > params.period_ns) {
         return Result<u64, Error>::err(Error::InvalidArgument);
     }
-    // Overflow-safe check for reasonable periods (< 10^12 ns = 1000 seconds)
     u64 const numer = params.wcet_ns * PPM_SCALE + (params.period_ns - 1ULL);
     u64 const ppm   = numer / params.period_ns;
     return Result<u64, Error>::ok(ppm);
 }
 
-// Exact CBS/EDF Admission Test: sum(U_i) + U_new <= MAX_RT_UTIL_PPM
 [[nodiscard]] constexpr Result<u64, Error> check_rt_admission(
     SchedTable const& table,
     RtParams          candidate
@@ -140,7 +139,6 @@ struct SchedDecision {
     return Option<u32>::none();
 }
 
-// Spawn and admit a thread (if IsochronousRt, runs exact EDF utilization gate!)
 [[nodiscard]] constexpr Result<ThreadId, Error> spawn_thread(
     SchedTable& table,
     ThreadId    desired_id,
@@ -165,11 +163,11 @@ struct SchedDecision {
     for (u32 i = 0; i < MAX_THREADS; ++i) {
         if (!table.threads[i].occupied) {
             ThreadControlBlock tcb{};
-            tcb.occupied = true;
-            tcb.id       = desired_id;
-            tcb.domain   = domain;
+            tcb.occupied    = true;
+            tcb.id          = desired_id;
+            tcb.domain      = domain;
             tcb.sched_class = sclass;
-            tcb.state    = ThreadState::Ready;
+            tcb.state       = ThreadState::Ready;
 
             if (sclass == SchedClass::IsochronousRt) {
                 tcb.rt                  = rt_params;
@@ -187,8 +185,96 @@ struct SchedDecision {
     return Result<ThreadId, Error>::err(Error::TableFull);
 }
 
-// Charge Ring-0 Kineticlet / IRQ execution time directly to owning RT thread's CBS budget!
-// Prevents interrupt storms from invisibly stealing CPU time from sibling Hard-RT tasks.
+// L4-MCS Scheduling Context Donation:
+//   Atomically transfers `donor_tid`'s CBS deadline & remaining budget to `worker_tid`
+//   so a Userspace Driver / Server executes Urgent-RT requests with zero priority inversion!
+[[nodiscard]] constexpr Result<Unit, Error> donate_cbs_context(
+    SchedTable& table,
+    ThreadId    donor_tid,
+    ThreadId    worker_tid
+) noexcept {
+    if (!donor_tid || !worker_tid || donor_tid == worker_tid) {
+        return Result<Unit, Error>::err(Error::InvalidArgument);
+    }
+
+    auto d_slot = find_thread_slot(table, donor_tid);
+    auto w_slot = find_thread_slot(table, worker_tid);
+    if (d_slot.is_none() || w_slot.is_none()) {
+        return Result<Unit, Error>::err(Error::NotFound);
+    }
+
+    ThreadControlBlock& donor  = table.threads[d_slot.value()];
+    ThreadControlBlock& worker = table.threads[w_slot.value()];
+
+    if (donor.sched_class != SchedClass::IsochronousRt || donor.remaining_budget_ns == 0) {
+        return Result<Unit, Error>::err(Error::InsufficientRights);
+    }
+    if (donor.loaned_to || worker.borrowed_from) {
+        return Result<Unit, Error>::err(Error::LoanActive);
+    }
+
+    // Snapshot worker's baseline scheduling parameters
+    worker.saved_class     = worker.sched_class;
+    worker.saved_budget_ns = worker.remaining_budget_ns;
+    worker.saved_deadline  = worker.abs_deadline;
+
+    // Conservation of CBS bandwidth: move remaining budget from donor -> worker!
+    worker.sched_class         = SchedClass::IsochronousRt;
+    worker.remaining_budget_ns = donor.remaining_budget_ns;
+    worker.abs_deadline        = donor.abs_deadline;
+    worker.borrowed_from       = donor.id;
+    if (worker.state == ThreadState::Blocked || worker.state == ThreadState::Throttled) {
+        worker.state = ThreadState::Ready;
+    }
+
+    donor.remaining_budget_ns = 0;
+    donor.loaned_to           = worker.id;
+    donor.state               = ThreadState::Blocked;
+
+    return Result<Unit, Error>::ok(Unit{});
+}
+
+// L4-MCS Context Return: restores worker's baseline class & returns unused budget to donor!
+[[nodiscard]] constexpr Result<ThreadId, Error> return_cbs_context(
+    SchedTable& table,
+    ThreadId    worker_tid
+) noexcept {
+    auto w_slot = find_thread_slot(table, worker_tid);
+    if (w_slot.is_none()) {
+        return Result<ThreadId, Error>::err(Error::NotFound);
+    }
+
+    ThreadControlBlock& worker = table.threads[w_slot.value()];
+    if (!worker.borrowed_from) {
+        return Result<ThreadId, Error>::err(Error::InvalidState);
+    }
+
+    ThreadId const donor_id = worker.borrowed_from;
+    u64 const leftover_ns   = worker.remaining_budget_ns;
+
+    // Restore worker's original scheduling parameters
+    worker.sched_class         = worker.saved_class;
+    worker.remaining_budget_ns = worker.saved_budget_ns;
+    worker.abs_deadline        = worker.saved_deadline;
+    worker.borrowed_from       = ThreadId{0};
+    if (worker.sched_class == SchedClass::IsochronousRt && worker.remaining_budget_ns == 0) {
+        worker.state = ThreadState::Throttled;
+    }
+
+    auto d_slot = find_thread_slot(table, donor_id);
+    if (d_slot.is_some()) {
+        ThreadControlBlock& donor = table.threads[d_slot.value()];
+        donor.loaned_to            = ThreadId{0};
+        donor.remaining_budget_ns += leftover_ns;
+        donor.state                = (donor.remaining_budget_ns > 0)
+                                       ? ThreadState::Ready
+                                       : ThreadState::Throttled;
+    }
+
+    return Result<ThreadId, Error>::ok(donor_id);
+}
+
+// Charge Ring-0 Kineticlet / IRQ execution time directly to owning RT thread's CBS budget
 constexpr void charge_external_wcet(
     SchedTable& table,
     ThreadId    owner_tid,
@@ -215,7 +301,6 @@ constexpr void charge_external_wcet(
     }
 }
 
-// Advance scheduler clock to `now`, replenish CBS periods, and pick optimal next thread
 [[nodiscard]] constexpr SchedDecision schedule_at(
     SchedTable& table,
     TickNs      now
@@ -255,20 +340,24 @@ constexpr void charge_external_wcet(
         }
     }
 
-    // Step 1: Replenish any Isochronous RT tasks whose CBS period boundary has arrived
+    // Step 1: Replenish native Isochronous RT tasks whose CBS period boundary has arrived
     TickNs earliest_replenish{0};
     for (u32 i = 0; i < MAX_THREADS; ++i) {
         ThreadControlBlock& tcb = table.threads[i];
-        if (!tcb.occupied || tcb.sched_class != SchedClass::IsochronousRt) continue;
+        if (!tcb.occupied) continue;
+        // Borrowed contexts belong to the donor's period, not `tcb.rt.period_ns`!
+        if (tcb.borrowed_from || tcb.rt.period_ns == 0) continue;
+        if (tcb.sched_class != SchedClass::IsochronousRt) continue;
 
         if (now >= tcb.replenish_at) {
-            // Advance period epochs cleanly even across multi-period idle gaps
             u64 const periods = 1ULL + ((now.raw - tcb.replenish_at.raw) / tcb.rt.period_ns);
             tcb.replenish_at = TickNs{tcb.replenish_at.raw + periods * tcb.rt.period_ns};
             tcb.abs_deadline = tcb.replenish_at;
-            tcb.remaining_budget_ns = tcb.rt.wcet_ns;
-            if (tcb.state == ThreadState::Throttled) {
-                tcb.state = ThreadState::Ready;
+            if (!tcb.loaned_to) {
+                tcb.remaining_budget_ns = tcb.rt.wcet_ns;
+                if (tcb.state == ThreadState::Throttled) {
+                    tcb.state = ThreadState::Ready;
+                }
             }
         }
 
@@ -308,7 +397,6 @@ constexpr void charge_external_wcet(
 
     SchedDecision decision{};
     if (chosen_idx.is_none()) {
-        // CPU enters low-power tickless idle until earliest RT replenishment (if any)
         table.current_thread             = ThreadId{0};
         decision.next_thread             = ThreadId{0};
         decision.next_domain             = DomainId{0};
@@ -326,7 +414,6 @@ constexpr void charge_external_wcet(
     }
     table.current_thread = winner.id;
 
-    // Compute exact tickless hardware timer deadline
     TickNs slice_end{};
     if (winner.sched_class == SchedClass::IsochronousRt) {
         slice_end = TickNs{now.raw + winner.remaining_budget_ns};

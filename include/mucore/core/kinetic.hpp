@@ -3,18 +3,13 @@
 // μCore Functional Core — "Kineticlets" (Verified Ring-0 Fast-Path Framework)
 // ============================================================================
 // Bridges the fundamental gap between Ring-0 Performance & Ring-3 Isolation:
-//   - Userspace drivers and security-sensitive services keep 95% of their code
-//     (complex init, parsing, recovery) isolated in unprivileged Ring 3.
-//   - For the 5% of code executed millions of times/sec (IRQ ack/coalescing,
-//     descriptor ring steering, telemetry aggregation, fast cache lookups),
-//     userspace submits a compact `KineticProgram` into Ring 0.
-//   - Unlike monolithic kernel modules (unsafe C++) or unbounded eBPF loops,
-//     Kineticlets enforce a Strictly Forward-Branching DAG instruction set:
-//       1. Linear O(N) static verification (no verifier state-space explosion).
-//       2. Guaranteed termination & zero raw pointer dereferences.
-//       3. Static Capability Rights enforcement (`Read`/`Write`/`UrgentRt`).
-//       4. Exact DAG Longest-Path WCET derivation (`wcet_ns`) so Hard Real-Time
-//          admission control accounts for Ring-0 fast-paths deterministically!
+//   - Userspace drivers keep 95% of their complexity isolated in Ring 3, while
+//     grafting compact, statically verified `KineticProgram` DAGs into Ring 0.
+//   - Hardened against Spectre v1 speculative out-of-bounds gadgets via
+//     branchless ALU `nospec_index_pow2` masking on both static & register-
+//     indexed (`LoadArenaIdx` / `StoreArenaIdx`) lookups!
+//   - Strictly Forward-Branching DAG guarantees O(N) single-pass verification,
+//     100% termination, and exact Longest-Path WCET (`wcet_ns`) for Hard RT!
 // ============================================================================
 
 #include "mucore/result.hpp"
@@ -35,23 +30,25 @@ inline constexpr u32 COST_BRANCH_NS = 3;
 inline constexpr u32 COST_RET_NS    = 2;
 
 enum class KineticOp : u8 {
-    Nop        = 0,
-    LoadImm    = 1,  // R[dst] = imm32
-    Mov        = 2,  // R[dst] = R[src]
-    Add        = 3,  // R[dst] = R[dst] + R[src]
-    Sub        = 4,  // R[dst] = R[dst] - R[src]
-    BitAnd     = 5,  // R[dst] = R[dst] & R[src]
-    BitOr      = 6,  // R[dst] = R[dst] | R[src]
-    BitXor     = 7,  // R[dst] = R[dst] ^ R[src]
-    Shl        = 8,  // R[dst] = R[dst] << (R[src] & 63)
-    Shr        = 9,  // R[dst] = R[dst] >> (R[src] & 63)
-    LoadState  = 10, // R[dst] = persistent_state[imm32]
-    StoreState = 11, // persistent_state[imm32] = R[src]
-    LoadArena  = 12, // R[dst] = shared_arena[imm32]  (Requires CapRights::Read)
-    StoreArena = 13, // shared_arena[imm32] = R[src]  (Requires CapRights::Write)
-    JumpIfEq   = 14, // if (R[dst] == R[src]) pc += imm32 (forward-only: imm32 >= 1)
-    JumpIfGt   = 15, // if (R[dst] >  R[src]) pc += imm32 (forward-only: imm32 >= 1)
-    Return     = 16, // Terminate with `ReturnVerdict(imm32)` and result `R[0]`
+    Nop           = 0,
+    LoadImm       = 1,  // R[dst] = imm32
+    Mov           = 2,  // R[dst] = R[src]
+    Add           = 3,  // R[dst] = R[dst] + R[src]
+    Sub           = 4,  // R[dst] = R[dst] - R[src]
+    BitAnd        = 5,  // R[dst] = R[dst] & R[src]
+    BitOr         = 6,  // R[dst] = R[dst] | R[src]
+    BitXor        = 7,  // R[dst] = R[dst] ^ R[src]
+    Shl           = 8,  // R[dst] = R[dst] << (R[src] & 63)
+    Shr           = 9,  // R[dst] = R[dst] >> (R[src] & 63)
+    LoadState     = 10, // R[dst] = persistent_state[imm32]
+    StoreState    = 11, // persistent_state[imm32] = R[src]
+    LoadArena     = 12, // R[dst] = shared_arena[imm32]            (Requires CapRights::Read)
+    StoreArena    = 13, // shared_arena[imm32] = R[src]            (Requires CapRights::Write)
+    LoadArenaIdx  = 14, // R[dst] = shared_arena[nospec(R[src])]   (Dynamic hash/ring lookup!)
+    StoreArenaIdx = 15, // shared_arena[nospec(R[dst])] = R[src]   (Dynamic ring slot write!)
+    JumpIfEq      = 16, // if (R[dst] == R[src]) pc += imm32 (forward-only: imm32 >= 1)
+    JumpIfGt      = 17, // if (R[dst] >  R[src]) pc += imm32 (forward-only: imm32 >= 1)
+    Return        = 18, // Terminate with `ReturnVerdict(imm32)` and result `R[0]`
 };
 
 // Verdict returned to Ring-0 Dispatcher upon Kineticlet completion
@@ -103,6 +100,12 @@ namespace dsl {
     [[nodiscard]] constexpr KineticInsn store_arena(u32 word_idx, u8 src) noexcept {
         return KineticInsn{KineticOp::StoreArena, 0, src, 0, word_idx};
     }
+    [[nodiscard]] constexpr KineticInsn load_arena_idx(u8 dst, u8 idx_reg) noexcept {
+        return KineticInsn{KineticOp::LoadArenaIdx, dst, idx_reg, 0, 0};
+    }
+    [[nodiscard]] constexpr KineticInsn store_arena_idx(u8 idx_reg, u8 val_reg) noexcept {
+        return KineticInsn{KineticOp::StoreArenaIdx, idx_reg, val_reg, 0, 0};
+    }
     [[nodiscard]] constexpr KineticInsn jump_if_eq(u8 lhs, u8 rhs, u32 forward_skip) noexcept {
         return KineticInsn{KineticOp::JumpIfEq, lhs, rhs, 0, forward_skip};
     }
@@ -142,10 +145,10 @@ struct KineticSlotState {
 
 // Execution Input Context (passed by value — pure & side-effect free!)
 struct KineticInput {
-    u64 arg0{0}; // e.g., FluxOpcode or IRQ status register snapshot
-    u64 arg1{0}; // offset / payload word 0
-    u64 arg2{0}; // length / payload word 1
-    u64 arg3{0}; // aux_param
+    u64 arg0{0};
+    u64 arg1{0};
+    u64 arg2{0};
+    u64 arg3{0};
 };
 
 // Execution Output (explicit delta on persistent state & shared arena)
@@ -166,6 +169,8 @@ struct KineticOutput {
         case KineticOp::StoreState:
         case KineticOp::LoadArena:
         case KineticOp::StoreArena:
+        case KineticOp::LoadArenaIdx:
+        case KineticOp::StoreArenaIdx:
             return COST_MEM_NS;
         case KineticOp::JumpIfEq:
         case KineticOp::JumpIfGt:
@@ -185,7 +190,6 @@ struct KineticOutput {
         return Result<VerifyReport, Error>::err(Error::VerificationFailed);
     }
 
-    // Last instruction MUST be an unconditional `Return` so execution can never fall off end!
     if (prog.insns[prog.len - 1].op != KineticOp::Return) {
         return Result<VerifyReport, Error>::err(Error::VerificationFailed);
     }
@@ -193,7 +197,6 @@ struct KineticOutput {
     u16  needed_rights = cap::CapRights::ExecuteRing0;
     bool uses_arena    = false;
 
-    // Pass 1: Validate every instruction's register indices, memory bounds, rights & DAG jumps
     for (u32 pc = 0; pc < prog.len; ++pc) {
         KineticInsn const& insn = prog.insns[pc];
 
@@ -237,9 +240,18 @@ struct KineticOutput {
                 uses_arena = true;
                 break;
 
+            case KineticOp::LoadArenaIdx:
+                needed_rights |= cap::CapRights::Read;
+                uses_arena = true;
+                break;
+
+            case KineticOp::StoreArenaIdx:
+                needed_rights |= cap::CapRights::Write;
+                uses_arena = true;
+                break;
+
             case KineticOp::JumpIfEq:
             case KineticOp::JumpIfGt: {
-                // Strictly forward non-zero jump: guarantees DAG (zero cycles -> 100% termination!)
                 if (insn.imm == 0) {
                     return Result<VerifyReport, Error>::err(Error::VerificationFailed);
                 }
@@ -265,12 +277,10 @@ struct KineticOutput {
         }
     }
 
-    // Verify caller holds all capability rights exercised by the bytecode
     if ((granted_rights & needed_rights) != needed_rights) {
         return Result<VerifyReport, Error>::err(Error::InsufficientRights);
     }
 
-    // Pass 2: Exact Backward Dynamic Programming on DAG for WCET & Max Steps!
     u32 dp_cost[MAX_KINETIC_INSNS]{};
     u32 dp_steps[MAX_KINETIC_INSNS]{};
 
@@ -308,7 +318,7 @@ struct KineticOutput {
 }
 
 // ============================================================================
-// PURE DETERMINISTIC RING-0 INTERPRETER (Bounded Fuel Defense-in-Depth)
+// PURE DETERMINISTIC RING-0 INTERPRETER (Spectre-v1 `nospec` Hardened!)
 // ============================================================================
 
 [[nodiscard]] constexpr Result<KineticOutput, Error> execute_verified(
@@ -327,78 +337,101 @@ struct KineticOutput {
     }
 
     u32 pc   = 0;
-    u32 fuel = MAX_KINETIC_INSNS; // Hardware/bug defense-in-depth fuel bound
+    u32 fuel = MAX_KINETIC_INSNS;
 
     while (pc < prog.len && fuel > 0) {
         --fuel;
         ++out.steps_executed;
         KineticInsn const& insn = prog.insns[pc];
 
+        u8 const dst = static_cast<u8>(nospec_index_pow2(insn.dst, NUM_KINETIC_REGS));
+        u8 const src = static_cast<u8>(nospec_index_pow2(insn.src, NUM_KINETIC_REGS));
+
         switch (insn.op) {
             case KineticOp::Nop:
                 ++pc;
                 break;
             case KineticOp::LoadImm:
-                regs[insn.dst] = static_cast<u64>(insn.imm);
+                regs[dst] = static_cast<u64>(insn.imm);
                 ++pc;
                 break;
             case KineticOp::Mov:
-                regs[insn.dst] = regs[insn.src];
+                regs[dst] = regs[src];
                 ++pc;
                 break;
             case KineticOp::Add:
-                regs[insn.dst] += regs[insn.src];
+                regs[dst] += regs[src];
                 ++pc;
                 break;
             case KineticOp::Sub:
-                regs[insn.dst] -= regs[insn.src];
+                regs[dst] -= regs[src];
                 ++pc;
                 break;
             case KineticOp::BitAnd:
-                regs[insn.dst] &= regs[insn.src];
+                regs[dst] &= regs[src];
                 ++pc;
                 break;
             case KineticOp::BitOr:
-                regs[insn.dst] |= regs[insn.src];
+                regs[dst] |= regs[src];
                 ++pc;
                 break;
             case KineticOp::BitXor:
-                regs[insn.dst] ^= regs[insn.src];
+                regs[dst] ^= regs[src];
                 ++pc;
                 break;
             case KineticOp::Shl:
-                regs[insn.dst] <<= (regs[insn.src] & 63ULL);
+                regs[dst] <<= (regs[src] & 63ULL);
                 ++pc;
                 break;
             case KineticOp::Shr:
-                regs[insn.dst] >>= (regs[insn.src] & 63ULL);
+                regs[dst] >>= (regs[src] & 63ULL);
                 ++pc;
                 break;
-            case KineticOp::LoadState:
-                regs[insn.dst] = out.next_state[insn.imm & (NUM_KINETIC_STATE_REGS - 1)];
+            case KineticOp::LoadState: {
+                u64 const sidx = nospec_index_pow2(insn.imm, NUM_KINETIC_STATE_REGS);
+                regs[dst] = out.next_state[sidx];
                 ++pc;
                 break;
-            case KineticOp::StoreState:
-                out.next_state[insn.imm & (NUM_KINETIC_STATE_REGS - 1)] = regs[insn.src];
+            }
+            case KineticOp::StoreState: {
+                u64 const sidx = nospec_index_pow2(insn.imm, NUM_KINETIC_STATE_REGS);
+                out.next_state[sidx] = regs[src];
                 ++pc;
                 break;
+            }
             case KineticOp::LoadArena:
                 if (arena_words != nullptr) {
-                    regs[insn.dst] = arena_words[insn.imm & (NUM_ARENA_WORDS - 1)];
+                    u64 const aidx = nospec_index_pow2(insn.imm, NUM_ARENA_WORDS);
+                    regs[dst] = arena_words[aidx];
                 }
                 ++pc;
                 break;
             case KineticOp::StoreArena:
                 if (arena_words != nullptr) {
-                    arena_words[insn.imm & (NUM_ARENA_WORDS - 1)] = regs[insn.src];
+                    u64 const aidx = nospec_index_pow2(insn.imm, NUM_ARENA_WORDS);
+                    arena_words[aidx] = regs[src];
+                }
+                ++pc;
+                break;
+            case KineticOp::LoadArenaIdx:
+                if (arena_words != nullptr) {
+                    u64 const aidx = nospec_index_pow2(regs[src], NUM_ARENA_WORDS);
+                    regs[dst] = arena_words[aidx];
+                }
+                ++pc;
+                break;
+            case KineticOp::StoreArenaIdx:
+                if (arena_words != nullptr) {
+                    u64 const aidx = nospec_index_pow2(regs[dst], NUM_ARENA_WORDS);
+                    arena_words[aidx] = regs[src];
                 }
                 ++pc;
                 break;
             case KineticOp::JumpIfEq:
-                pc = (regs[insn.dst] == regs[insn.src]) ? (pc + 1 + insn.imm) : (pc + 1);
+                pc = (regs[dst] == regs[src]) ? (pc + 1 + insn.imm) : (pc + 1);
                 break;
             case KineticOp::JumpIfGt:
-                pc = (regs[insn.dst] > regs[insn.src]) ? (pc + 1 + insn.imm) : (pc + 1);
+                pc = (regs[dst] > regs[src]) ? (pc + 1 + insn.imm) : (pc + 1);
                 break;
             case KineticOp::Return:
                 out.verdict      = static_cast<ReturnVerdict>(insn.imm);
