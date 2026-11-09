@@ -7,10 +7,13 @@
 // AND the Four-Lineage Synthesis (Zircon + Windows NT + Plan 9 + L4 MCS).
 // ============================================================================
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "mucore/core/dispatcher.hpp"
+#include "mucore/core/smp.hpp"
+#include "mucore/core/vmspace.hpp"
 #include "mucore/shell/hal.hpp"
 #include "mucore/shell/shared_conduit.hpp"
 
@@ -583,12 +586,346 @@ void test_l4_mcs_async_cbs_donation() {
     ++g_passed;
 }
 
+// ----------------------------------------------------------------------------
+// Test 10: Phase 2 — 4-Level `VmSpace` (W^X, MPK, KPTI) & Per-Core Magazines
+// ----------------------------------------------------------------------------
+void test_vmspace_and_percore_magazines() {
+    printf("[TEST 10] VmSpace 4-Level Paging (W^X, MPK, StrictKpti) & Magazines...\n");
+    static vm::VmTablePool pool{};
+    auto kpml4 = vm::alloc_pt_node(pool);
+    MUCORE_CHECK(kpml4.is_ok(), "Allocated root Kernel PML4 node");
+
+    pool.nodes[kpml4.value()].entries[256] = 0x0000'0000'0010'0103ULL; // HHDM Global
+    pool.nodes[kpml4.value()].entries[511] = 0x0000'0000'0020'0103ULL; // Kernel Trampoline
+
+    // 1. Constitutional W^X check
+    auto wx_err = vm::encode_leaf_pte(
+        VirtAddr{0x0040'0000ULL}, PhysAddr{0x0080'0000ULL},
+        vm::MapPermissions{.writable = true, .executable = true, .user_accessible = true}
+    );
+    MUCORE_CHECK(wx_err.error() == Error::WxorXViolation,
+                 "Simultaneous Writable + Executable mapping rejected with WxorXViolation");
+
+    // 2. Compare `SharedHigherHalf` (0-CR3 switch default) vs `StrictKpti` (sandbox opt-in)
+    auto shared_dom = vm::create_domain_vmspace(
+        pool, kpml4.value(), DomainId{11}, vm::KptiMode::SharedHigherHalf
+    );
+    auto kpti_dom = vm::create_domain_vmspace(
+        pool, kpml4.value(), DomainId{12}, vm::KptiMode::StrictKpti
+    );
+    MUCORE_CHECK(shared_dom.is_ok() && kpti_dom.is_ok(), "Created SharedHigherHalf and StrictKpti domains");
+    MUCORE_CHECK(pool.nodes[shared_dom.value().user_pml4_node].entries[256] != 0ULL,
+                 "SharedHigherHalf retains Global HHDM PML4[256] for 0-CR3-switch fast path");
+    MUCORE_CHECK(pool.nodes[kpti_dom.value().user_pml4_node].entries[256] == 0ULL &&
+                 pool.nodes[kpti_dom.value().user_pml4_node].entries[511] != 0ULL,
+                 "StrictKpti strips PML4[256..510] while keeping PML4[511] entry trampoline");
+
+    // 3. Map & walk 4-level GrantArena page tagged with MPK `PkeyId{11}`
+    VirtAddr const va{0x0000'003F'1020'4000ULL};
+    PhysAddr const pa{0x0000'0000'0480'0000ULL};
+    MUCORE_CHECK(vm::map_page_4k(pool, kpti_dom.value().user_pml4_node, va, pa,
+                                 vm::MapPermissions{
+                                     .writable        = true,
+                                     .executable      = false,
+                                     .user_accessible = true,
+                                     .mpk_key         = PkeyId{11},
+                                 }).is_ok(),
+                 "Mapped 4 KiB page across 4-level PML4->PDPT->PD->PT hierarchy");
+
+    auto leaf = vm::walk_page_table(pool, kpti_dom.value().user_pml4_node, va);
+    MUCORE_CHECK(leaf.is_ok() &&
+                 (leaf.value() & vm::PTE_ADDR_MASK) == pa.raw &&
+                 vm::extract_pte_mpk(leaf.value()) == PkeyId{11} &&
+                 (leaf.value() & vm::PTE_NX) != 0ULL,
+                 "4-level MMU walk verified physical address, NX bit, and MPK PkeyId{11}");
+
+    // 4. Per-Core Magazine Hard-RT Reserve Watermark (`RT_EMERGENCY_WATERMARK = 8`)
+    mm::PhysPoolState      pstate{};
+    mm::LocalFrameMagazine mag{};
+    MUCORE_CHECK(mm::refill_magazine_batch(mag, pstate) == 32u, "Batch-refilled 32 frames");
+    for (usize i = 0; i < 24u; ++i) {
+        MUCORE_CHECK(mm::alloc_from_magazine(mag, false).is_ok(), "Tier-1 pop above watermark");
+    }
+    MUCORE_CHECK(mm::alloc_from_magazine(mag, false).error() == Error::RtReserveProtected,
+                 "Tier-1 Async blocked from exhausting last 8 Hard-RT emergency frames");
+    MUCORE_CHECK(mm::alloc_from_magazine(mag, true).is_ok(),
+                 "Tier-0 Hard-RT allocated immediately from emergency watermark with 0 locks");
+
+    printf("  [PASS] 4-level VmSpace W^X/MPK/StrictKpti & Hard-RT Magazine reserve verified.\n");
+    ++g_passed;
+}
+
+// ----------------------------------------------------------------------------
+// Test 11: Phase 2 — 4-OS-Thread Concurrent SMP Stress & Deterministic Replay
+// ----------------------------------------------------------------------------
+struct SmpThreadCtx {
+    smp::SmpNodeState* node{nullptr};
+    u16                cpu_idx{0};
+    cap::CapToken      shared_live_cap{};
+    PhysAddr           allocated_frames[40]{};
+    u32                start_barrier{0};
+    bool               ok{true};
+};
+
+static u32 g_smp_ready_count = 0;
+static u32 g_smp_phase2_go   = 0;
+
+void* smp_worker_entry(void* raw_arg) {
+    auto* ctx = static_cast<SmpThreadCtx*>(raw_arg);
+    smp::SmpNodeState& node = *ctx->node;
+    CpuId const cpu{ctx->cpu_idx};
+
+    // Synchronize all 4 OS threads so contention is maximally simultaneous!
+    (void)__atomic_fetch_add(&g_smp_ready_count, 1u, __ATOMIC_ACQ_REL);
+    while (__atomic_load_n(&g_smp_ready_count, __ATOMIC_ACQUIRE) < 4u) {
+        #if defined(__x86_64__)
+        asm volatile("pause" : : : "memory");
+        #endif
+    }
+
+    // 1. Parallel Per-Core Magazine Allocations (40 frames * 4 threads = 160 frames!)
+    for (usize i = 0; i < 40; ++i) {
+        auto f = smp::alloc_shard_frame(node, cpu, (i >= 32));
+        if (f.is_err()) {
+            ctx->ok = false;
+            return nullptr;
+        }
+        ctx->allocated_frames[i] = f.value();
+    }
+
+    // 2. Lock-Free SeqLock `CapTable` Validation Under Live Concurrent Churn!
+    for (u32 iter = 0; iter < 500; ++iter) {
+        auto v = cap::validate_capability(
+            node.shared_caps, DomainId{1}, ctx->shared_live_cap,
+            cap::CapObjectKind::FluxConduit, cap::CapRights::Read
+        );
+        if (v.is_err()) {
+            ctx->ok = false;
+            return nullptr;
+        }
+
+        // Core 0 simultaneously churns transient capabilities + epoch revocations!
+        if (cpu.raw == 0 && (iter % 10u == 0u)) {
+            node.cold_lock.lock();
+            auto m = cap::plan_mint_root(
+                node.shared_caps, DomainId{9}, cap::CapObjectKind::FluxConduit,
+                cap::CapRights::Read | cap::CapRights::Revoke, 999ULL, cap::RevocationGroupId{20}
+            );
+            if (m.is_ok()) {
+                cap::apply_mutation(node.shared_caps, m.value());
+                auto r = cap::plan_revoke_lineage(node.shared_caps, DomainId{9}, m.value().minted_token);
+                if (r.is_ok()) cap::apply_mutation(node.shared_caps, r.value());
+            }
+            node.cold_lock.unlock();
+        }
+    }
+
+    // Barrier before cross-core PKRU shootdown + L4-MCS CBS parcel exchange
+    (void)__atomic_fetch_add(&g_smp_phase2_go, 1u, __ATOMIC_ACQ_REL);
+    while (__atomic_load_n(&g_smp_phase2_go, __ATOMIC_ACQUIRE) < 4u) {
+        #if defined(__x86_64__)
+        asm volatile("pause" : : : "memory");
+        #endif
+    }
+
+    // 3. Cross-Core L4-MCS CBS Loans + Targeted `PKRU` Coherence
+    //    - Pair A: Core 0 (RT Donor 100) -> Core 1 (Async Worker 101)
+    //    - Pair B: Core 2 (RT Donor 200) -> Core 3 (Async Worker 201)
+    //    - PKRU:   Core 0 seals single-core `DomainId{10}` (0 IPIs!) and
+    //              2-core `DomainId{20}` shared ONLY with Core 2 (1 targeted IPI!)
+    if (cpu.raw == 0) {
+        u32 const ipis_single = smp::seal_domain_pkru_coherent(node, cpu, DomainId{10}, PkeyId{3});
+        u32 const ipis_shared = smp::seal_domain_pkru_coherent(node, cpu, DomainId{20}, PkeyId{7});
+        if (ipis_single != 0u || ipis_shared != 1u) {
+            ctx->ok = false;
+            return nullptr;
+        }
+
+        // Loan 200us budget / 500us deadline from Core 0 Thread 100 -> Core 1 Thread 101
+        if (smp::execute_on_cpu_shard(node, cpu, smp::ShardEvent{
+                .kind          = smp::ShardEventKind::LocalCbsRemoteCall,
+                .timestamp     = TickNs{1'000ULL},
+                .local_thread  = ThreadId{100},
+                .remote_worker = ThreadId{101},
+                .remote_cpu    = CpuId{1},
+            }).is_err()) {
+            ctx->ok = false;
+            return nullptr;
+        }
+
+        // Wait for Core 1's `RefundRemoteCbs` parcel!
+        while (node.shards[0].telemetry.remote_cbs_refunds_rcvd == 0) {
+            (void)smp::drain_incoming_parcels(node, cpu, TickNs{51'000ULL});
+        }
+    } else if (cpu.raw == 1) {
+        // Wait for Core 0's `DonateRemoteCbs` parcel, run for 50us, and return leftover!
+        while (node.shards[1].telemetry.parcels_received == 0) {
+            (void)smp::drain_incoming_parcels(node, cpu, TickNs{1'000ULL});
+        }
+        if (smp::execute_on_cpu_shard(node, cpu, smp::ShardEvent{
+                .kind         = smp::ShardEventKind::LocalWorkerComplete,
+                .timestamp    = TickNs{51'000ULL},
+                .local_thread = ThreadId{101},
+            }).is_err()) {
+            ctx->ok = false;
+            return nullptr;
+        }
+    } else if (cpu.raw == 2) {
+        // Loan 300us budget / 600us deadline from Core 2 Thread 200 -> Core 3 Thread 201
+        if (smp::execute_on_cpu_shard(node, cpu, smp::ShardEvent{
+                .kind          = smp::ShardEventKind::LocalCbsRemoteCall,
+                .timestamp     = TickNs{2'000ULL},
+                .local_thread  = ThreadId{200},
+                .remote_worker = ThreadId{201},
+                .remote_cpu    = CpuId{3},
+            }).is_err()) {
+            ctx->ok = false;
+            return nullptr;
+        }
+
+        // Wait for BOTH Core 0's targeted `SyncPkruSeal` AND Core 3's `RefundRemoteCbs`!
+        while (node.shards[2].telemetry.remote_cbs_refunds_rcvd == 0 ||
+               node.shards[2].telemetry.pkru_seals_applied == 0) {
+            (void)smp::drain_incoming_parcels(node, cpu, TickNs{82'000ULL});
+        }
+    } else if (cpu.raw == 3) {
+        // Wait for Core 2's `DonateRemoteCbs` parcel, run for 80us, and return leftover!
+        while (node.shards[3].telemetry.parcels_received == 0) {
+            (void)smp::drain_incoming_parcels(node, cpu, TickNs{2'000ULL});
+        }
+        if (smp::execute_on_cpu_shard(node, cpu, smp::ShardEvent{
+                .kind         = smp::ShardEventKind::LocalWorkerComplete,
+                .timestamp    = TickNs{82'000ULL},
+                .local_thread = ThreadId{201},
+            }).is_err()) {
+            ctx->ok = false;
+            return nullptr;
+        }
+    }
+
+    return nullptr;
+}
+
+void seed_smp_core_threads(sched::SchedTable& sc, u16 cpu_idx) {
+    if (cpu_idx == 0) {
+        (void)sched::spawn_thread(
+            sc, ThreadId{100}, DomainId{10}, sched::SchedClass::IsochronousRt,
+            sched::RtParams{.wcet_ns = 200'000ULL, .period_ns = 500'000ULL}, TickNs{0}
+        );
+    } else if (cpu_idx == 1) {
+        (void)sched::spawn_thread(
+            sc, ThreadId{101}, DomainId{11}, sched::SchedClass::AsyncThroughput,
+            sched::RtParams{}, TickNs{0}
+        );
+    } else if (cpu_idx == 2) {
+        (void)sched::spawn_thread(
+            sc, ThreadId{200}, DomainId{20}, sched::SchedClass::IsochronousRt,
+            sched::RtParams{.wcet_ns = 300'000ULL, .period_ns = 600'000ULL}, TickNs{0}
+        );
+    } else if (cpu_idx == 3) {
+        (void)sched::spawn_thread(
+            sc, ThreadId{201}, DomainId{21}, sched::SchedClass::AsyncThroughput,
+            sched::RtParams{}, TickNs{0}
+        );
+    }
+}
+
+void test_concurrent_4thread_smp_sharding_and_replay() {
+    printf("[TEST 11] 4-OS-Thread SMP Sharding, CBS IPI Loans, PKRU & Per-Core Replay...\n");
+    static smp::SmpNodeState smp_node{};
+
+    // Mint shared read-lockless capability validated concurrently by all 4 OS threads
+    auto live_mut = cap::plan_mint_root(
+        smp_node.shared_caps, DomainId{1}, cap::CapObjectKind::FluxConduit,
+        cap::CapRights::Read | cap::CapRights::Write, 42ULL, cap::RevocationGroupId{1}
+    );
+    MUCORE_CHECK(live_mut.is_ok(), "Minted shared root capability");
+    cap::apply_mutation(smp_node.shared_caps, live_mut.value());
+
+    // Configure active-domain CPU bitmasks:
+    //   - `DomainId{10}` runs ONLY on Core 0 -> 0-IPI local WRPKRU fast path!
+    //   - `DomainId{20}` runs on Core 0 AND Core 2 -> targeted 1-IPI shootdown to Core 2 ONLY!
+    smp::track_domain_enter_cpu(smp_node, DomainId{10}, CpuId{0});
+    smp::track_domain_enter_cpu(smp_node, DomainId{20}, CpuId{0});
+    smp::track_domain_enter_cpu(smp_node, DomainId{20}, CpuId{2});
+
+    for (u16 c = 0; c < 4; ++c) {
+        smp_node.shards[c].online = true;
+        seed_smp_core_threads(smp_node.shards[c].sched, c);
+    }
+
+    pthread_t    threads[4]{};
+    SmpThreadCtx ctxs[4]{};
+    g_smp_ready_count = 0;
+    g_smp_phase2_go   = 0;
+
+    for (u16 c = 0; c < 4; ++c) {
+        ctxs[c].node            = &smp_node;
+        ctxs[c].cpu_idx         = c;
+        ctxs[c].shared_live_cap = live_mut.value().minted_token;
+        MUCORE_CHECK(pthread_create(&threads[c], nullptr, &smp_worker_entry, &ctxs[c]) == 0,
+                     "Spawned OS pthread for simulated SMP CPU core");
+    }
+    for (u16 c = 0; c < 4; ++c) {
+        (void)pthread_join(threads[c], nullptr);
+        MUCORE_CHECK(ctxs[c].ok, "SMP core pthread completed all invariants cleanly");
+    }
+
+    // 1. Verify all 160 physical frames allocated across 4 cores are 100% unique!
+    for (u16 c1 = 0; c1 < 4; ++c1) {
+        for (usize i = 0; i < 40; ++i) {
+            for (u16 c2 = c1; c2 < 4; ++c2) {
+                for (usize j = (c1 == c2 ? i + 1 : 0); j < 40; ++j) {
+                    MUCORE_CHECK(!(ctxs[c1].allocated_frames[i] == ctxs[c2].allocated_frames[j]),
+                                 "Zero duplicate physical frames across concurrent 4-core magazines");
+                }
+            }
+        }
+    }
+
+    // 2. Verify Active-Core Targeted `PKRU` Coherence (Cores 1 and 3 received ZERO PKRU IPIs!)
+    MUCORE_CHECK(smp_node.shards[0].telemetry.local_zero_ipi_seals == 1 &&
+                 smp_node.shards[0].telemetry.targeted_pkru_ipis_sent == 1,
+                 "Core 0 used 0-IPI fast path for Domain 10 and 1 targeted IPI for Domain 20");
+    MUCORE_CHECK(smp_node.shards[2].telemetry.pkru_seals_applied == 1 &&
+                 smp_node.shards[1].telemetry.pkru_seals_applied == 0 &&
+                 smp_node.shards[3].telemetry.pkru_seals_applied == 0,
+                 "Targeted SyncPkruSeal delivered ONLY to sibling Core 2 (Cores 1 & 3 undisturbed!)");
+
+    // 3. Verify Exact Cross-Core CBS Bandwidth Conservation
+    MUCORE_CHECK(smp_node.shards[0].sched.threads[0].remaining_budget_ns == 150'000ULL &&
+                 smp_node.shards[2].sched.threads[0].remaining_budget_ns == 220'000ULL,
+                 "Exact CBS budget conservation across concurrent cross-core IPI loans (150us & 220us)");
+
+    // 4. Deterministic Per-Core Time-Travel Replay (`replay_shard_trace`) on All 4 Shards!
+    static smp::CpuShard replayed[4]{};
+    for (u16 c = 0; c < 4; ++c) {
+        replayed[c].cpu_id = CpuId{c};
+        seed_smp_core_threads(replayed[c].sched, c);
+
+        auto rep = smp::replay_shard_trace(smp_node.shards[c].trace, replayed[c]);
+        MUCORE_CHECK(rep.is_ok() && rep.value() == smp_node.shards[c].trace.count(),
+                     "Single-core deterministic replay succeeded on recorded SMP shard trace");
+        MUCORE_CHECK(replayed[c].sched.current_thread == smp_node.shards[c].sched.current_thread &&
+                     replayed[c].sched.threads[0].remaining_budget_ns ==
+                         smp_node.shards[c].sched.threads[0].remaining_budget_ns &&
+                     replayed[c].sched.threads[0].total_runtime_ns ==
+                         smp_node.shards[c].sched.threads[0].total_runtime_ns &&
+                     replayed[c].telemetry.parcels_received ==
+                         smp_node.shards[c].telemetry.parcels_received,
+                     "Replayed shard state matches live 4-thread SMP run 100% bit-for-bit!");
+    }
+
+    printf("  [PASS] 4-thread SMP sharding, 160 magazine allocs, targeted PKRU & 4-core replay verified!\n");
+    ++g_passed;
+}
+
 } // namespace
 
 int main() {
     printf("======================================================================\n");
-    printf("  μCore (mucore-kernel) — FCIS & Four-Lineage Verification Suite\n");
-    printf("  Compile-Time `static_assert` Proofs (6 Theorem Suites): PASSED\n");
+    printf("  μCore (mucore-kernel) — FCIS, Four-Lineage & SMP Verification Suite\n");
+    printf("  Compile-Time `static_assert` Proofs (9 Theorem Suites): PASSED\n");
     printf("======================================================================\n");
 
     test_capabilities();
@@ -600,6 +937,8 @@ int main() {
     test_plan9_capability_namespaces();
     test_nt_mpk_quarantine_and_colocation();
     test_l4_mcs_async_cbs_donation();
+    test_vmspace_and_percore_magazines();
+    test_concurrent_4thread_smp_sharding_and_replay();
 
     printf("----------------------------------------------------------------------\n");
     printf("Summary: %d passed, %d failed.\n", g_passed, g_failed);

@@ -17,6 +17,9 @@ public:
     constexpr X86Hal() noexcept = default;
 
     void set_hardware_live(bool live) noexcept { hardware_live_ = live; }
+    void set_pku_supported(bool supported) noexcept { pku_supported_ = supported; }
+    [[nodiscard]] bool is_hardware_live() const noexcept { return hardware_live_; }
+    [[nodiscard]] bool is_pku_supported() const noexcept { return pku_supported_; }
 
     void switch_address_space(DomainId domain) noexcept {
         cr3_reloads_ += 1;

@@ -22,12 +22,16 @@ inline constexpr u16 USER_CS   = 0x20 | 3;
 inline constexpr u16 TSS_SEL   = 0x28;
 
 // Architectural Model-Specific Registers (MSRs)
-inline constexpr u32 MSR_IA32_EFER         = 0xC000'0080u;
-inline constexpr u32 MSR_IA32_STAR         = 0xC000'0081u;
-inline constexpr u32 MSR_IA32_LSTAR        = 0xC000'0082u;
-inline constexpr u32 MSR_IA32_FMASK        = 0xC000'0084u;
-inline constexpr u32 MSR_IA32_TSC_DEADLINE = 0x0000'06E0u;
-inline constexpr u32 MSR_X2APIC_EOI        = 0x0000'080Bu;
+inline constexpr u32 MSR_IA32_EFER           = 0xC000'0080u;
+inline constexpr u32 MSR_IA32_STAR           = 0xC000'0081u;
+inline constexpr u32 MSR_IA32_LSTAR          = 0xC000'0082u;
+inline constexpr u32 MSR_IA32_FMASK          = 0xC000'0084u;
+inline constexpr u32 MSR_IA32_FS_BASE        = 0xC000'0100u;
+inline constexpr u32 MSR_IA32_GS_BASE        = 0xC000'0101u;
+inline constexpr u32 MSR_IA32_KERNEL_GS_BASE = 0xC000'0102u;
+inline constexpr u32 MSR_IA32_TSC_DEADLINE   = 0x0000'06E0u;
+inline constexpr u32 MSR_X2APIC_EOI          = 0x0000'080Bu;
+inline constexpr u32 MSR_X2APIC_ICR          = 0x0000'0830u; // 64-bit x2APIC IPI command MSR!
 
 inline constexpr u64 EFER_SCE              = 1ULL << 0;  // System Call Extensions
 inline constexpr u64 RFLAGS_IF             = 1ULL << 9;  // Mask IF on SYSCALL entry
@@ -109,7 +113,22 @@ inline void write_pkru_seal_writes(PkeyId key) noexcept {
     );
 }
 
+[[nodiscard]] inline u64 read_cr2() noexcept {
+    u64 addr = 0;
+    asm volatile("mov %%cr2, %0" : "=r"(addr));
+    return addr;
+}
+
+// Send a register-based x2APIC Fixed IPI (`MSR_X2APIC_ICR = 0x830`) — zero MMIO serialization!
+inline void send_x2apic_ipi(u32 dest_lapic_id, u8 vector) noexcept {
+    u64 const icr = (static_cast<u64>(dest_lapic_id) << 32) |
+                    (1ULL << 14) | // Level = Assert
+                    static_cast<u64>(vector);
+    wrmsr(MSR_X2APIC_ICR, icr);
+}
+
 extern "C" void x86_64_load_gdt_and_tss(DescriptorPtr const* gdtr, u16 cs_sel, u16 ds_sel, u16 tss_sel) noexcept;
+extern "C" void x86_64_load_idt(DescriptorPtr const* idtr) noexcept;
 extern "C" void x86_64_syscall_entry() noexcept;
 
 inline void encode_tss_descriptor(GdtTable& gdt, TaskStateSegment64 const* tss) noexcept {

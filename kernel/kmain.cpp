@@ -1,17 +1,21 @@
 // ============================================================================
-// μCore (mucore-kernel) — Bare-Metal Ring-0 Entry & Imperative Shell Bootstrap
+// μCore (mucore-kernel) — Bare-Metal Ring-0 SMP Entry & Imperative Shell
 // ============================================================================
 // Every file-scope state object is marked `constinit` — guaranteeing static
 // compile-time initialization in `.bss`/`.data` with ZERO hidden `.init_array`
-// constructors before `kmain()` executes.
+// constructors before `kmain()` executes (enforced by `linker.ld` ASSERT).
 // ============================================================================
 
 #include "mucore/core/dispatcher.hpp"
+#include "mucore/core/smp.hpp"
+#include "mucore/core/vmspace.hpp"
 #include "mucore/shell/hal.hpp"
 #include "mucore/shell/shared_conduit.hpp"
 #include "kernel/arch/x86_64/cpu.hpp"
 #include "kernel/arch/x86_64/hal_x86_64.hpp"
+#include "kernel/arch/x86_64/idt.hpp"
 #include "kernel/arch/x86_64/limine_proto.hpp"
+#include "kernel/arch/x86_64/percpu.hpp"
 #include "kernel/arch/x86_64/serial.hpp"
 
 // ----------------------------------------------------------------------------
@@ -59,9 +63,6 @@ int memcmp(const void* s1, const void* s2, size_t n) noexcept {
     return 0;
 }
 
-extern char boot_stack_top[];
-extern char ist1_stack_top[];
-
 } // extern "C"
 
 namespace {
@@ -86,16 +87,65 @@ constinit limine::MemmapRequest g_memmap_req{
     .response = nullptr,
 };
 
-// Explicit Static Ring-0 Hardware & Kernel Runtime State (`constinit` -> zero hidden ctors!)
-constinit TaskStateSegment64                 g_bsp_tss{};
-constinit GdtTable                           g_bsp_gdt{};
-constinit X86Hal                             g_hal{};
+[[gnu::used, gnu::section(".limine_requests")]]
+constinit limine::SmpRequest g_smp_req{
+    .id       = {limine::COMMON_MAGIC_0, limine::COMMON_MAGIC_1,
+                 0x95a67b819a1b857eULL, 0xa0b61b723b6a73e0ULL},
+    .revision = 0,
+    .response = nullptr,
+    .flags    = limine::SMP_FLAG_X2APIC,
+};
+
+// Explicit Static Ring-0 Hardware & Hybrid SMP Kernel State (`constinit` -> zero `.init_array`!)
+constinit PerCpuArchBlock                        g_percpu[MAX_SMP_CPUS]{};
+constinit IdtTable                               g_idt{};
+constinit core::smp::SmpNodeState                g_smp{};
+constinit core::vm::VmTablePool                  g_vm_pool{};
+constinit core::smp::ColdTicketLock              g_serial_lock{};
+constinit u32                                    g_online_cpu_count{0};
+constinit X86Hal                                 g_hal{};
 constinit shell::ImperativeKernelRuntime<X86Hal> g_kernel{g_hal};
 
-// Boot-time Functional Core verification & Split-Plane Pact smoke check
+// Ring an x2APIC `VEC_SMP_PARCEL_IPI` doorbell to every remote CPU set in `cpu_mask`
+inline void notify_remote_cpus_ipi(u64 cpu_mask) noexcept {
+    if (!g_hal.is_hardware_live()) return;
+    while (cpu_mask != 0ULL) {
+        u32 const dst = ctz64(cpu_mask);
+        cpu_mask &= ~(1ULL << dst);
+        if (dst < MAX_SMP_CPUS && __atomic_load_n(&g_smp.shards[dst].online, __ATOMIC_ACQUIRE)) {
+            send_x2apic_ipi(g_percpu[dst].lapic_id, VEC_SMP_PARCEL_IPI);
+        }
+    }
+}
+
+// Application Processor (AP) Hardware Bootstrap Entry (`LimineSmpRequest`)
+[[noreturn]] void ap_entry(limine::SmpInfo* info) noexcept {
+    u32 const cpu_idx = static_cast<u32>(info->extra_argument);
+    if (cpu_idx < MAX_SMP_CPUS) {
+        init_percpu_arch(g_percpu[cpu_idx], cpu_idx, info->lapic_id);
+        load_idt_on_current_cpu(g_idt);
+
+        __atomic_store_n(&g_smp.shards[cpu_idx].online, true, __ATOMIC_RELEASE);
+        (void)__atomic_fetch_add(&g_online_cpu_count, 1u, __ATOMIC_ACQ_REL);
+
+        g_serial_lock.lock();
+        SerialCom1::puts("[mucore] SMP AP online: CpuId=");
+        SerialCom1::write_u64(cpu_idx);
+        SerialCom1::puts(" (x2APIC=");
+        SerialCom1::write_u64(info->lapic_id);
+        SerialCom1::puts(")\n");
+        g_serial_lock.unlock();
+    }
+
+    for (;;) {
+        asm volatile("sti; hlt");
+    }
+}
+
+// Boot-time Functional Core, VmSpace W^X/KPTI, and SMP Sharding Power-On Self-Test
 void run_boot_post() noexcept {
     using namespace mucore::core;
-    SerialCom1::puts("[mucore] Running Functional Core Power-On Self-Test (POST)...\n");
+    SerialCom1::puts("[mucore] Running Functional Core + SMP + VmSpace POST...\n");
 
     KernelState& st = g_kernel.state();
     DomainId const drv_dom{1};
@@ -136,20 +186,17 @@ void run_boot_post() noexcept {
     );
     if (irq_cap_mut.is_ok()) cap::apply_mutation(st.caps, irq_cap_mut.value());
 
-    // 3. Install Verified Ring-0 Kineticlet Fast-Path (if error bit 0x8000 set -> Escalate Ring 3, else Fast Complete!)
+    // 3. Install Verified Ring-0 Kineticlet Fast-Path
     kinetic::KineticProgram prog{};
     prog.insns[0] = kinetic::dsl::load_imm(4, 0x8000u);
     prog.insns[1] = kinetic::dsl::mov(5, 0);
     prog.insns[2] = kinetic::dsl::bit_and(5, 4);
-    prog.insns[3] = kinetic::dsl::jump_if_eq(5, 4, 3); // Forward jump to [7] Escalate!
+    prog.insns[3] = kinetic::dsl::jump_if_eq(5, 4, 5); // 3 + 1 + 5 = [9] Escalate!
     prog.insns[4] = kinetic::dsl::load_state(6, 0);
     prog.insns[5] = kinetic::dsl::load_imm(7, 1);
     prog.insns[6] = kinetic::dsl::add(6, 7);
     prog.insns[7] = kinetic::dsl::store_state(0, 6);
     prog.insns[8] = kinetic::dsl::ret(kinetic::ReturnVerdict::CompleteFastPath);
-    prog.len      = 9;
-    // Fix jump target: pc=3 + 1 + skip = 9 -> let's place Escalate at [9] and Return at [10]
-    prog.insns[3] = kinetic::dsl::jump_if_eq(5, 4, 5); // 3 + 1 + 5 = 9!
     prog.insns[9] = kinetic::dsl::ret(kinetic::ReturnVerdict::EscalateToUserspace);
     prog.len      = 10;
 
@@ -182,6 +229,31 @@ void run_boot_post() noexcept {
         .irq_status_word = 0x0001ULL,
     });
 
+    // 5. Phase 2 VmSpace W^X + MPK + KPTI & Per-Core Magazine Self-Check
+    auto kpml4 = vm::alloc_pt_node(g_vm_pool);
+    if (kpml4.is_ok()) {
+        g_vm_pool.nodes[kpml4.value()].entries[256] = 0x0000'0000'0010'0103ULL; // HHDM Global
+        g_vm_pool.nodes[kpml4.value()].entries[511] = 0x0000'0000'0020'0103ULL; // Trampoline
+        auto sandbox_vm = vm::create_domain_vmspace(
+            g_vm_pool, kpml4.value(), DomainId{2}, vm::KptiMode::StrictKpti
+        );
+        auto wx_reject = vm::encode_leaf_pte(
+            VirtAddr{0x40'0000ULL}, PhysAddr{0x20'0000ULL},
+            vm::MapPermissions{.writable = true, .executable = true, .user_accessible = true}
+        );
+        if (sandbox_vm.is_ok() && wx_reject.error() == Error::WxorXViolation) {
+            SerialCom1::puts("[mucore] VmSpace W^X & StrictKpti isolation verified.\n");
+        }
+    }
+
+    // 6. Pre-warm Core 0 Per-CPU Physical Frame Magazine (32 frames, 0-lock RT ready!)
+    auto boot_frame = smp::alloc_shard_frame(g_smp, CpuId{0}, true);
+    if (boot_frame.is_ok()) {
+        SerialCom1::puts("[mucore] Core 0 Frame Magazine primed at PhysAddr=");
+        SerialCom1::write_hex(boot_frame.value().raw);
+        SerialCom1::puts("\n");
+    }
+
     SerialCom1::puts("[mucore] POST Passed: Ring0FastOps=");
     SerialCom1::write_u64(st.telemetry.ring0_fast_handled);
     SerialCom1::puts(", ContextSwitches=");
@@ -191,14 +263,19 @@ void run_boot_post() noexcept {
 
 } // namespace
 
-// Cold-path & Doorbell `SYSCALL` C handler invoked by `x86_64_syscall_entry`
+// ----------------------------------------------------------------------------
+// Multi-Core `SYSCALL`, Exception & Interrupt Imperative Shell Entry Points
+// ----------------------------------------------------------------------------
+
 extern "C" mucore::u64 mucore_syscall_entry_c(
     mucore::u64 op,
     mucore::u64 arg0,
     mucore::u64 arg1,
-    mucore::u64 arg2
+    mucore::u64 arg2,
+    mucore::u32 cpu_id
 ) noexcept {
     using namespace mucore;
+    CpuId const  local_cpu{static_cast<u16>(cpu_id)};
     TickNs const now{arch::x86_64::rdtsc_ordered()};
 
     // Syscall 1: Cold/Warm Flux Doorbell Kick
@@ -214,44 +291,139 @@ extern "C" mucore::u64 mucore_syscall_entry_c(
         return res.is_ok() ? 0ULL : static_cast<u64>(res.error());
     }
 
-    // Syscall 2: O(1) Capability Lineage Epoch Revocation
+    // Syscall 2: O(1) Capability Lineage Epoch Revocation (SMP release-ordered!)
     if (op == 2ULL) {
-        core::KernelEvent ev{};
-        ev.kind          = core::EventKind::RevokeCapability;
-        ev.timestamp     = now;
-        ev.caller_domain = DomainId{static_cast<u32>(arg0)};
-        ev.cap_token     = core::cap::CapToken{arg1};
+        g_smp.cold_lock.lock();
+        auto plan = core::cap::plan_revoke_lineage(
+            g_smp.shared_caps, DomainId{static_cast<u32>(arg0)}, core::cap::CapToken{arg1}
+        );
+        if (plan.is_ok()) {
+            core::cap::apply_mutation(g_smp.shared_caps, plan.value());
+        }
+        g_smp.cold_lock.unlock();
+        return plan.is_ok() ? 0ULL : static_cast<u64>(plan.error());
+    }
 
-        auto res = g_kernel.handle_event(ev);
-        return res.is_ok() ? 0ULL : static_cast<u64>(res.error());
+    // Syscall 3: Cross-Core L4-MCS CBS Deadline & Budget Loan (`DonateRemoteCbs` IPI Parcel)
+    if (op == 3ULL) {
+        core::smp::ShardEvent const ev{
+            .kind          = core::smp::ShardEventKind::LocalCbsRemoteCall,
+            .timestamp     = now,
+            .local_thread  = ThreadId{static_cast<u32>(arg0)},
+            .remote_worker = ThreadId{static_cast<u32>(arg1)},
+            .remote_cpu    = CpuId{static_cast<u16>(arg2)},
+        };
+        auto res = core::smp::execute_on_cpu_shard(g_smp, local_cpu, ev);
+        if (res.is_err()) {
+            return static_cast<u64>(res.error());
+        }
+        if (res.value().is_some()) {
+            notify_remote_cpus_ipi(1ULL << res.value().value().raw);
+        }
+        return 0ULL;
+    }
+
+    // Syscall 4: Active-Core Coherent `PKRU` Seal (0 IPIs if single-core, targeted otherwise!)
+    if (op == 4ULL) {
+        DomainId const dom{static_cast<u32>(arg0)};
+        PkeyId const   pkey{static_cast<u8>(arg1 & 0xFu)};
+
+        if (g_hal.is_pku_supported()) {
+            arch::x86_64::write_pkru_seal_writes(pkey);
+        }
+        u64 ipi_mask = 0ULL;
+        (void)core::smp::seal_domain_pkru_coherent(g_smp, local_cpu, dom, pkey, &ipi_mask);
+        if (ipi_mask != 0ULL) {
+            notify_remote_cpus_ipi(ipi_mask);
+        }
+        return 0ULL;
     }
 
     return static_cast<u64>(Error::InvalidArgument);
 }
 
-// Bare-Metal Kernel Entry Point (`_start` -> `kmain`)
+extern "C" [[noreturn]] void mucore_exception_handler_c(
+    mucore::u32 vector,
+    mucore::u64 error_code,
+    mucore::u32 cpu_id
+) noexcept {
+    using namespace mucore::arch::x86_64;
+    u64 const cr2 = (vector == VEC_PAGE_FAULT) ? read_cr2() : 0ULL;
+
+    g_serial_lock.lock();
+    SerialCom1::puts("\n[mucore] CPU FAULT on CpuId=");
+    SerialCom1::write_u64(cpu_id);
+    SerialCom1::puts(" Vector=");
+    SerialCom1::write_u64(vector);
+    SerialCom1::puts(" Err=");
+    SerialCom1::write_hex(error_code);
+    if (vector == VEC_PAGE_FAULT) {
+        SerialCom1::puts(" CR2=");
+        SerialCom1::write_hex(cr2);
+    }
+    SerialCom1::puts("\n");
+    g_serial_lock.unlock();
+
+    for (;;) {
+        asm volatile("cli; hlt");
+    }
+}
+
+extern "C" void mucore_irq_vector_c(
+    mucore::u32 vector,
+    mucore::u64 error_code,
+    mucore::u32 cpu_id
+) noexcept {
+    (void)error_code;
+    using namespace mucore;
+    using namespace mucore::arch::x86_64;
+
+    CpuId const  local_cpu{static_cast<u16>(cpu_id)};
+    TickNs const now{rdtsc_ordered()};
+
+    if (vector == VEC_APIC_TIMER) {
+        (void)core::smp::execute_on_cpu_shard(g_smp, local_cpu, core::smp::ShardEvent{
+            .kind      = core::smp::ShardEventKind::LocalTimer,
+            .timestamp = now,
+        });
+        wrmsr(MSR_X2APIC_EOI, 0ULL);
+    } else if (vector == VEC_SMP_PARCEL_IPI) {
+        u16 pkru_seal_mask = 0;
+        (void)core::smp::drain_incoming_parcels(g_smp, local_cpu, now, &pkru_seal_mask);
+        while (pkru_seal_mask != 0u) {
+            u32 const key = ctz64(static_cast<u64>(pkru_seal_mask));
+            pkru_seal_mask &= static_cast<u16>(~(1u << key));
+            if (g_hal.is_pku_supported()) {
+                write_pkru_seal_writes(PkeyId{static_cast<u8>(key)});
+            }
+        }
+        wrmsr(MSR_X2APIC_EOI, 0ULL);
+    }
+    // Spurious vector 255 intentionally omits EOI per Intel SDM Vol. 3A 10.9.
+}
+
+// ----------------------------------------------------------------------------
+// Bare-Metal Kernel Entry Point (`_start` -> `kmain` on Bootstrap Processor)
+// ----------------------------------------------------------------------------
 extern "C" [[noreturn]] void kmain() noexcept {
     using namespace mucore;
     using namespace mucore::arch::x86_64;
 
     SerialCom1::init();
     SerialCom1::puts("\n============================================================\n");
-    SerialCom1::puts("  mucore-kernel (uCore) v0.1.0 — Hybrid FCIS C++23 Kernel\n");
-    SerialCom1::puts("  Zero Hidden Mechanisms | Kineticlets | CBS-RT | Flux IPC\n");
+    SerialCom1::puts("  mucore-kernel (uCore) v0.2.0 — Hybrid SMP FCIS C++23\n");
+    SerialCom1::puts("  Zero Hidden Mechanisms | Per-CPU Shards | VmSpace | CBS-RT\n");
     SerialCom1::puts("============================================================\n");
 
-    // Configure BSP TSS & GDT + Fast SYSCALL/SYSRETQ MSRs
-    g_bsp_tss.rsp0 = reinterpret_cast<u64>(boot_stack_top);
-    g_bsp_tss.ist1 = reinterpret_cast<u64>(ist1_stack_top);
-    encode_tss_descriptor(g_bsp_gdt, &g_bsp_tss);
+    // 1. Initialize Shared 256-Entry IDT + Core 0 Per-CPU `%gs`, GDT, TSS & SYSCALL
+    u32 const bsp_lapic = (g_smp_req.response != nullptr) ? g_smp_req.response->bsp_lapic_id : 0u;
+    build_shared_idt(g_idt);
+    init_percpu_arch(g_percpu[0], 0u, bsp_lapic);
+    load_idt_on_current_cpu(g_idt);
 
-    DescriptorPtr const gdtr{
-        .limit = sizeof(GdtTable) - 1u,
-        .base  = reinterpret_cast<u64>(&g_bsp_gdt),
-    };
-    x86_64_load_gdt_and_tss(&gdtr, KERNEL_CS, KERNEL_SS, TSS_SEL);
-    init_fast_syscall_msrs();
-    SerialCom1::puts("[mucore] GDT, 64-bit TSS, and Fast SYSCALL/SYSRETQ armed.\n");
+    __atomic_store_n(&g_smp.shards[0].online, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_online_cpu_count, 1u, __ATOMIC_RELEASE);
+    SerialCom1::puts("[mucore] Core 0 %gs Per-CPU GDT/TSS, 256-gate IDT & SYSCALL armed.\n");
 
     if (g_hhdm_req.response != nullptr) {
         SerialCom1::puts("[mucore] Limine HHDM Offset: ");
@@ -259,12 +431,38 @@ extern "C" [[noreturn]] void kmain() noexcept {
         SerialCom1::puts("\n");
     }
 
+    // 2. Wake Application Processors (APs) via Limine SMP Protocol
+    if (g_smp_req.response != nullptr && g_smp_req.response->cpu_count > 1ULL) {
+        u64 const total_hw_cpus = g_smp_req.response->cpu_count;
+        u32 next_logical_id     = 1u;
+        for (u64 i = 0; i < total_hw_cpus && next_logical_id < MAX_SMP_CPUS; ++i) {
+            limine::SmpInfo* info = g_smp_req.response->cpus[i];
+            if (info == nullptr || info->lapic_id == bsp_lapic) {
+                continue;
+            }
+            info->extra_argument = next_logical_id++;
+            __atomic_store_n(&info->goto_address, &ap_entry, __ATOMIC_RELEASE);
+        }
+
+        // Bounded spin waiting for woken APs to finish `%gs` + IDT bring-up
+        for (u32 spin = 0; spin < 5'000'000u; ++spin) {
+            if (__atomic_load_n(&g_online_cpu_count, __ATOMIC_ACQUIRE) >= next_logical_id) {
+                break;
+            }
+            asm volatile("pause" : : : "memory");
+        }
+    }
+
+    SerialCom1::puts("[mucore] Online SMP Execution Shards: ");
+    SerialCom1::write_u64(__atomic_load_n(&g_online_cpu_count, __ATOMIC_ACQUIRE));
+    SerialCom1::puts("\n");
+
     run_boot_post();
 
     g_hal.set_hardware_live(true);
-    SerialCom1::puts("[mucore] Entering tickless Imperative Shell loop.\n");
+    SerialCom1::puts("[mucore] Entering tickless multi-core Imperative Shell loop.\n");
 
     for (;;) {
-        asm volatile("hlt");
+        asm volatile("sti; hlt");
     }
 }

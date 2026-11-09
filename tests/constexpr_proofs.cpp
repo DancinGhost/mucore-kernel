@@ -7,6 +7,8 @@
 // ============================================================================
 
 #include "mucore/core/dispatcher.hpp"
+#include "mucore/core/smp.hpp"
+#include "mucore/core/vmspace.hpp"
 
 namespace mucore::proofs {
 
@@ -285,5 +287,193 @@ consteval bool prove_l4_mcs_async_donation() {
 
 static_assert(prove_l4_mcs_async_donation(),
               "Compile-time proof failed: L4-MCS async CBS context donation broken!");
+
+// ----------------------------------------------------------------------------
+// Proof 7: 4-Level `VmSpace` Constitutional W^X, MPK PTE[62:59] & Strict KPTI
+// ----------------------------------------------------------------------------
+consteval bool prove_vmspace_wxorx_mpk_and_kpti() {
+    vm::VmTablePool pool{};
+    auto kpml4 = vm::alloc_pt_node(pool);
+    if (kpml4.is_err()) return false;
+
+    // Seed Kernel Higher-Half HHDM [256] and Entry Trampoline [511]
+    pool.nodes[kpml4.value()].entries[256] = 0x0000'0000'0010'0103ULL;
+    pool.nodes[kpml4.value()].entries[511] = 0x0000'0000'0020'0103ULL;
+
+    // 1. Constitutional W^X: Writable + Executable MUST fail!
+    auto wx_bad = vm::encode_leaf_pte(
+        VirtAddr{0x0040'0000ULL}, PhysAddr{0x0080'0000ULL},
+        vm::MapPermissions{.writable = true, .executable = true, .user_accessible = true}
+    );
+    if (wx_bad.error() != Error::WxorXViolation) return false;
+
+    // 2. Ring-3 User access in Higher-Half Kernel space MUST fail!
+    auto hh_bad = vm::encode_leaf_pte(
+        VirtAddr{vm::HIGHER_HALF_BASE + 0x1000ULL}, PhysAddr{0x0080'0000ULL},
+        vm::MapPermissions{.writable = false, .executable = false, .user_accessible = true}
+    );
+    if (hh_bad.error() != Error::InsufficientRights) return false;
+
+    // 3. Default `SharedHigherHalf` vs Opt-In `StrictKpti` PML4 Isolation
+    auto fast_dom = vm::create_domain_vmspace(
+        pool, kpml4.value(), DomainId{1}, vm::KptiMode::SharedHigherHalf
+    );
+    auto kpti_dom = vm::create_domain_vmspace(
+        pool, kpml4.value(), DomainId{2}, vm::KptiMode::StrictKpti
+    );
+    if (fast_dom.is_err() || kpti_dom.is_err()) return false;
+
+    if (pool.nodes[fast_dom.value().user_pml4_node].entries[256] == 0ULL) return false;
+    if (pool.nodes[kpti_dom.value().user_pml4_node].entries[256] != 0ULL) return false;
+    if (pool.nodes[kpti_dom.value().user_pml4_node].entries[511] == 0ULL) return false;
+
+    // 4. Full 4-Level Map (`PML4 -> PDPT -> PD -> PT`) + MPK Key 9 Round-Trip Walk
+    VirtAddr const arena_va{0x0000'007F'8040'2000ULL};
+    PhysAddr const arena_pa{0x0000'0000'0240'0000ULL};
+    if (vm::map_page_4k(pool, kpti_dom.value().user_pml4_node, arena_va, arena_pa,
+                        vm::MapPermissions{
+                            .writable        = true,
+                            .executable      = false,
+                            .user_accessible = true,
+                            .mpk_key         = PkeyId{9},
+                        }).is_err()) {
+        return false;
+    }
+
+    auto walked = vm::walk_page_table(pool, kpti_dom.value().user_pml4_node, arena_va);
+    if (walked.is_err()) return false;
+    u64 const pte = walked.value();
+
+    return ((pte & vm::PTE_ADDR_MASK) == arena_pa.raw) &&
+           ((pte & vm::PTE_NX) != 0ULL) &&
+           ((pte & vm::PTE_WRITABLE) != 0ULL) &&
+           (vm::extract_pte_mpk(pte) == PkeyId{9});
+}
+
+static_assert(prove_vmspace_wxorx_mpk_and_kpti(),
+              "Compile-time proof failed: VmSpace W^X, MPK PTE encoding, or StrictKpti broken!");
+
+// ----------------------------------------------------------------------------
+// Proof 8: Per-Core Magazine Hard-RT Watermark & Fragmented Contiguous Frames
+// ----------------------------------------------------------------------------
+consteval bool prove_percore_magazine_and_contiguous() {
+    mm::PhysPoolState      pool{};
+    mm::LocalFrameMagazine mag{};
+
+    // Refill 1 batch (32 frames) into local CPU magazine
+    if (mm::refill_magazine_batch(mag, pool) != mm::MAGAZINE_BATCH_SIZE) return false;
+
+    // Tier-1 Async (`is_hard_rt = false`) can pop 24 frames (32 -> 8), then hits watermark!
+    for (usize i = 0; i < (mm::MAGAZINE_BATCH_SIZE - mm::RT_EMERGENCY_WATERMARK); ++i) {
+        if (mm::alloc_from_magazine(mag, false).is_err()) return false;
+    }
+    if (mag.count != mm::RT_EMERGENCY_WATERMARK) return false;
+    if (mm::alloc_from_magazine(mag, false).error() != Error::RtReserveProtected) return false;
+
+    // Tier-0 Hard-RT (`is_hard_rt = true`) bypasses watermark in O(1) with 0 locks!
+    if (mm::alloc_from_magazine(mag, true).is_err() || mag.count != 7u) return false;
+
+    // Fragmentation resilience: free frames 33 and 35 to create non-contiguous 1-frame holes,
+    // then allocate 4 contiguous DMA frames and verify contiguous run placement!
+    mm::PhysPoolState frag_pool{};
+    auto f0 = mm::alloc_frame(frag_pool); // idx 0
+    auto f1 = mm::alloc_frame(frag_pool); // idx 1
+    auto f2 = mm::alloc_frame(frag_pool); // idx 2
+    auto f3 = mm::alloc_frame(frag_pool); // idx 3
+    (void)f0; (void)f2;
+    (void)mm::free_frame(frag_pool, f1.value()); // Hole at idx 1 (size 1)
+    (void)mm::free_frame(frag_pool, f3.value()); // Free from idx 3 onward!
+
+    auto contig4 = mm::alloc_contiguous_frames(frag_pool, 4);
+    return contig4.is_ok() &&
+           (contig4.value() == frag_pool.base_addr.offset(3ULL * PAGE_SIZE_4K));
+}
+
+static_assert(prove_percore_magazine_and_contiguous(),
+              "Compile-time proof failed: Per-core magazine RT watermark or contiguous alloc broken!");
+
+// ----------------------------------------------------------------------------
+// Proof 9: Cross-Core SMP CBS Loan Parcels & Per-Shard Deterministic Replay
+// ----------------------------------------------------------------------------
+consteval bool prove_smp_cross_core_cbs_and_replay() {
+    smp::CpuShard core0{};
+    core0.cpu_id = CpuId{0};
+    smp::CpuShard core1{};
+    core1.cpu_id = CpuId{1};
+
+    // Core 0: Hard-RT Robotics Donor (200us budget, 500us deadline)
+    (void)sched::spawn_thread(
+        core0.sched, ThreadId{10}, DomainId{1}, sched::SchedClass::IsochronousRt,
+        sched::RtParams{200'000ULL, 500'000ULL}, TickNs{0}
+    );
+    // Core 1: Tier-1 Async Driver Worker (`ThreadId{20}`) + Competing 2ms RT (`ThreadId{21}`)
+    (void)sched::spawn_thread(
+        core1.sched, ThreadId{20}, DomainId{2}, sched::SchedClass::AsyncThroughput,
+        sched::RtParams{}, TickNs{0}
+    );
+    (void)sched::spawn_thread(
+        core1.sched, ThreadId{21}, DomainId{3}, sched::SchedClass::IsochronousRt,
+        sched::RtParams{200'000ULL, 2'000'000ULL}, TickNs{0}
+    );
+
+    // 1. Core 0 initiates cross-core CBS loan -> emits `DonateRemoteCbs` parcel!
+    smp::ShardEvent const ev_call{
+        .kind          = smp::ShardEventKind::LocalCbsRemoteCall,
+        .timestamp     = TickNs{0},
+        .local_thread  = ThreadId{10},
+        .remote_worker = ThreadId{20},
+        .remote_cpu    = CpuId{1},
+    };
+    core0.trace.record(ev_call);
+    auto out0 = smp::step_cpu_shard(core0, ev_call);
+    if (out0.is_err() || out0.value().outbound_parcel.is_none()) return false;
+
+    // 2. Core 1 receives `DonateRemoteCbs` -> Worker 20 preempts 2ms RT Thread 21!
+    smp::ShardEvent const ev_recv_loan{
+        .kind      = smp::ShardEventKind::IncomingParcel,
+        .timestamp = TickNs{0},
+        .parcel    = out0.value().outbound_parcel.value(),
+    };
+    core1.trace.record(ev_recv_loan);
+    auto out1 = smp::step_cpu_shard(core1, ev_recv_loan);
+    if (out1.is_err() || !(out1.value().sched_dec.next_thread == ThreadId{20})) return false;
+
+    // 3. Core 1 Worker 20 runs for 60us (`t = 60,000ns`) & finishes -> emits `RefundRemoteCbs`!
+    smp::ShardEvent const ev_done{
+        .kind         = smp::ShardEventKind::LocalWorkerComplete,
+        .timestamp    = TickNs{60'000ULL},
+        .local_thread = ThreadId{20},
+    };
+    core1.trace.record(ev_done);
+    auto out2 = smp::step_cpu_shard(core1, ev_done);
+    if (out2.is_err() || out2.value().outbound_parcel.is_none()) return false;
+
+    // 4. Core 0 receives `RefundRemoteCbs` -> Donor 10 resumes with 140us leftover budget!
+    smp::ShardEvent const ev_refund{
+        .kind      = smp::ShardEventKind::IncomingParcel,
+        .timestamp = TickNs{60'000ULL},
+        .parcel    = out2.value().outbound_parcel.value(),
+    };
+    core0.trace.record(ev_refund);
+    auto out3 = smp::step_cpu_shard(core0, ev_refund);
+    if (out3.is_err() || !(out3.value().sched_dec.next_thread == ThreadId{10})) return false;
+    if (core0.sched.threads[0].remaining_budget_ns != 140'000ULL) return false;
+
+    // 5. Replay Core 0's `ShardTraceRing` into a fresh `CpuShard` in complete single-core isolation!
+    smp::CpuShard replay0{};
+    replay0.cpu_id = CpuId{0};
+    (void)sched::spawn_thread(
+        replay0.sched, ThreadId{10}, DomainId{1}, sched::SchedClass::IsochronousRt,
+        sched::RtParams{200'000ULL, 500'000ULL}, TickNs{0}
+    );
+    auto rep_res = smp::replay_shard_trace(core0.trace, replay0);
+    return rep_res.is_ok() &&
+           (rep_res.value() == 2u) &&
+           (replay0.sched.threads[0].remaining_budget_ns == 140'000ULL) &&
+           (replay0.sched.current_thread == ThreadId{10});
+}
+
+static_assert(prove_smp_cross_core_cbs_and_replay(),
+              "Compile-time proof failed: Cross-core SMP CBS loan parcel or shard replay broken!");
 
 } // namespace mucore::proofs

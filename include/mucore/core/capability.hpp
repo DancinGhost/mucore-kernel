@@ -154,7 +154,10 @@ struct CapTable {
     return Option<u32>::none();
 }
 
-// Exact O(1) validation: checks bounds, occupancy, generation, epoch, owner, kind, rights
+// Exact O(1) lock-free SMP validation:
+//   - At compile time (`if consteval`): pure constexpr evaluation.
+//   - At runtime on SMP: acquire-ordered generation/epoch loads + post-read
+//     generation re-check (lock-free SeqLock pattern prevents torn slot reads!).
 [[nodiscard]] constexpr Result<CapEntry, Error> validate_capability(
     CapTable const& table,
     DomainId        caller,
@@ -167,29 +170,77 @@ struct CapTable {
         return Result<CapEntry, Error>::err(Error::InvalidCapability);
     }
 
-    CapEntry const& entry = table.slots[idx];
-    if (!entry.occupied || entry.generation != token.generation()) {
+    CapEntry const& slot = table.slots[idx];
+    bool occ       = false;
+    u32  gen_first = 0;
+
+    if consteval {
+        occ       = slot.occupied;
+        gen_first = slot.generation;
+    } else {
+        occ       = __atomic_load_n(&slot.occupied, __ATOMIC_ACQUIRE);
+        gen_first = __atomic_load_n(&slot.generation, __ATOMIC_ACQUIRE);
+    }
+
+    if (!occ || gen_first != token.generation()) {
         return Result<CapEntry, Error>::err(Error::InvalidCapability);
     }
 
-    if (entry.rev_group.raw >= MAX_REVOCATION_GROUPS ||
-        table.group_epochs[entry.rev_group.raw] != entry.bound_epoch) {
+    CapEntry snap{};
+    snap.occupied   = occ;
+    snap.generation = gen_first;
+
+    if consteval {
+        snap.owner       = slot.owner;
+        snap.kind        = slot.kind;
+        snap.rights      = slot.rights;
+        snap.rev_group   = slot.rev_group;
+        snap.bound_epoch = slot.bound_epoch;
+        snap.object_id   = slot.object_id;
+    } else {
+        snap.owner       = DomainId{__atomic_load_n(&slot.owner.raw, __ATOMIC_RELAXED)};
+        __atomic_load(&slot.kind, &snap.kind, __ATOMIC_RELAXED);
+        snap.rights      = __atomic_load_n(&slot.rights, __ATOMIC_RELAXED);
+        snap.rev_group   = RevocationGroupId{__atomic_load_n(&slot.rev_group.raw, __ATOMIC_RELAXED)};
+        snap.bound_epoch = __atomic_load_n(&slot.bound_epoch, __ATOMIC_RELAXED);
+        snap.object_id   = __atomic_load_n(&slot.object_id, __ATOMIC_RELAXED);
+    }
+
+    u32 cur_epoch  = 0;
+    u32 gen_second = gen_first;
+    if (snap.rev_group.raw >= MAX_REVOCATION_GROUPS) {
         return Result<CapEntry, Error>::err(Error::RevokedCapability);
     }
 
-    if (!(entry.owner == caller)) {
+    if consteval {
+        cur_epoch = table.group_epochs[snap.rev_group.raw];
+    } else {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        gen_second = __atomic_load_n(&slot.generation, __ATOMIC_ACQUIRE);
+        bool const occ_second = __atomic_load_n(&slot.occupied, __ATOMIC_ACQUIRE);
+        if (!occ_second || gen_second != gen_first) {
+            return Result<CapEntry, Error>::err(Error::InvalidCapability);
+        }
+        cur_epoch = __atomic_load_n(&table.group_epochs[snap.rev_group.raw], __ATOMIC_ACQUIRE);
+    }
+
+    if (cur_epoch != snap.bound_epoch) {
+        return Result<CapEntry, Error>::err(Error::RevokedCapability);
+    }
+
+    if (!(snap.owner == caller)) {
         return Result<CapEntry, Error>::err(Error::DomainMismatch);
     }
 
-    if (expected_kind != CapObjectKind::None && entry.kind != expected_kind) {
+    if (expected_kind != CapObjectKind::None && snap.kind != expected_kind) {
         return Result<CapEntry, Error>::err(Error::InvalidCapability);
     }
 
-    if ((entry.rights & required_rights) != required_rights) {
+    if ((snap.rights & required_rights) != required_rights) {
         return Result<CapEntry, Error>::err(Error::InsufficientRights);
     }
 
-    return Result<CapEntry, Error>::ok(entry);
+    return Result<CapEntry, Error>::ok(snap);
 }
 
 // Plan root capability creation (used by kernel bootstrap or privileged broker)
@@ -329,25 +380,54 @@ struct CapTable {
     return Result<CapMutation, Error>::ok(mut);
 }
 
-// Deterministic in-place application of a `CapMutation` (used by Shell & constexpr tests)
+// Deterministic in-place application of a `CapMutation` (SMP release-ordered!)
 constexpr void apply_mutation(CapTable& table, CapMutation const& mut) noexcept {
     switch (mut.type) {
         case CapMutation::Type::None:
             break;
         case CapMutation::Type::WriteSlot:
             if (mut.slot_idx > 0 && mut.slot_idx < MAX_CAP_SLOTS) {
-                table.slots[mut.slot_idx] = mut.new_entry;
+                if consteval {
+                    table.slots[mut.slot_idx] = mut.new_entry;
+                } else {
+                    CapEntry& dst = table.slots[mut.slot_idx];
+                    // Mark unoccupied & invalidate generation (0) before touching payload fields!
+                    __atomic_store_n(&dst.occupied, false, __ATOMIC_RELEASE);
+                    __atomic_store_n(&dst.generation, 0u, __ATOMIC_RELEASE);
+                    __atomic_thread_fence(__ATOMIC_RELEASE);
+                    CapObjectKind kind_val = mut.new_entry.kind;
+                    __atomic_store_n(&dst.owner.raw, mut.new_entry.owner.raw, __ATOMIC_RELAXED);
+                    __atomic_store(&dst.kind, &kind_val, __ATOMIC_RELAXED);
+                    __atomic_store_n(&dst.rights, mut.new_entry.rights, __ATOMIC_RELAXED);
+                    __atomic_store_n(&dst.rev_group.raw, mut.new_entry.rev_group.raw, __ATOMIC_RELAXED);
+                    __atomic_store_n(&dst.bound_epoch, mut.new_entry.bound_epoch, __ATOMIC_RELAXED);
+                    __atomic_store_n(&dst.object_id, mut.new_entry.object_id, __ATOMIC_RELAXED);
+                    __atomic_store_n(&dst.generation, mut.new_entry.generation, __ATOMIC_RELEASE);
+                    __atomic_store_n(&dst.occupied, mut.new_entry.occupied, __ATOMIC_RELEASE);
+                }
             }
             break;
         case CapMutation::Type::ClearSlot:
             if (mut.slot_idx > 0 && mut.slot_idx < MAX_CAP_SLOTS) {
-                table.slots[mut.slot_idx].occupied = false;
-                table.slots[mut.slot_idx].generation += 1;
+                if consteval {
+                    table.slots[mut.slot_idx].occupied = false;
+                    table.slots[mut.slot_idx].generation += 1;
+                } else {
+                    CapEntry& dst = table.slots[mut.slot_idx];
+                    __atomic_store_n(&dst.occupied, false, __ATOMIC_RELEASE);
+                    (void)__atomic_fetch_add(&dst.generation, 1u, __ATOMIC_ACQ_REL);
+                }
             }
             break;
         case CapMutation::Type::BumpGroupEpoch:
             if (mut.target_group.raw < MAX_REVOCATION_GROUPS) {
-                table.group_epochs[mut.target_group.raw] += 1;
+                if consteval {
+                    table.group_epochs[mut.target_group.raw] += 1;
+                } else {
+                    (void)__atomic_fetch_add(
+                        &table.group_epochs[mut.target_group.raw], 1u, __ATOMIC_ACQ_REL
+                    );
+                }
             }
             break;
     }

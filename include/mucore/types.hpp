@@ -4,8 +4,7 @@
 // ============================================================================
 // Design Mandate: "No Hidden Mechanisms"
 //   - Zero reliance on hosted C++ standard library runtime.
-//   - Register-sized strong wrappers prevent accidental parameter transposition
-//     (e.g., passing a ThreadId where a DomainId is expected is a type error).
+//   - Register-sized strong wrappers prevent accidental parameter transposition.
 //   - All operations are constexpr, deterministic, and O(1).
 // ============================================================================
 
@@ -26,7 +25,9 @@ using usize = size_t;
 using uptr  = uintptr_t;
 
 inline constexpr usize PAGE_SIZE_4K     = 4096ULL;
+inline constexpr usize PAGE_SIZE_2M     = 2ULL * 1024ULL * 1024ULL;
 inline constexpr usize CACHE_LINE_BYTES = 64ULL;
+inline constexpr usize MAX_SMP_CPUS     = 8ULL;  // Per-CPU static shard array bound (<= 64)
 
 // Empty value type for fallible void operations: Result<Unit, Error>
 struct Unit {
@@ -36,6 +37,11 @@ struct Unit {
 // ----------------------------------------------------------------------------
 // Strongly-Typed Kernel Identifiers (Register-Sized POD Wrappers)
 // ----------------------------------------------------------------------------
+struct CpuId {
+    u16 raw{0};
+    constexpr bool operator==(CpuId const&) const noexcept = default;
+};
+
 struct DomainId {
     u32 raw{0};
     constexpr bool operator==(DomainId const&) const noexcept = default;
@@ -113,7 +119,7 @@ struct TickNs {
     constexpr bool operator>=(TickNs const& o) const noexcept { return raw >= o.raw; }
 };
 
-// Pure constexpr trailing-zeros bit scan (used for O(1) bitmaps in Port & Memory)
+// Pure constexpr trailing-zeros bit scan (used for O(1) bitmaps in Port, Memory & SMP)
 [[nodiscard]] constexpr u32 ctz64(u64 val) noexcept {
     u32 count = 0;
     while ((val & 1ULL) == 0ULL && count < 64u) {
@@ -121,6 +127,14 @@ struct TickNs {
         ++count;
     }
     return count;
+}
+
+// Pure constexpr SWAR 64-bit population count (O(1) branchless ALU!)
+[[nodiscard]] constexpr u32 popcount64(u64 x) noexcept {
+    x = x - ((x >> 1) & 0x5555'5555'5555'5555ULL);
+    x = (x & 0x3333'3333'3333'3333ULL) + ((x >> 2) & 0x3333'3333'3333'3333ULL);
+    x = (x + (x >> 4)) & 0x0F0F'0F0F'0F0F'0F0FULL;
+    return static_cast<u32>((x * 0x0101'0101'0101'0101ULL) >> 56);
 }
 
 // Branchless Spectre-v1 speculative index mask (exact for all 64-bit `idx`, zero branches):
@@ -157,31 +171,37 @@ enum class Error : u8 {
     DmaInFlightQuarantined,  // Physical frames quarantined until hardware/IOMMU DMA drains
     NamespaceNotFound,       // Plan-9 per-domain mount table lookup missed
     LoanActive,              // L4 MCS CBS scheduling context already loaned out
+    RtReserveProtected,      // Non-RT thread hit per-core emergency RT frame watermark
+    WxorXViolation,          // Attempted page-table mapping that is both Writable and Executable
+    CrossCoreTargetRequired, // Target thread/domain lives on a remote CPU shard
 };
 
 [[nodiscard]] constexpr const char* error_name(Error err) noexcept {
     switch (err) {
-        case Error::None:                   return "None";
-        case Error::InvalidArgument:        return "InvalidArgument";
-        case Error::InvalidCapability:      return "InvalidCapability";
-        case Error::RevokedCapability:      return "RevokedCapability";
-        case Error::InsufficientRights:     return "InsufficientRights";
-        case Error::DomainMismatch:         return "DomainMismatch";
-        case Error::TableFull:              return "TableFull";
-        case Error::QuotaExceeded:          return "QuotaExceeded";
-        case Error::AdmissionRejected:      return "AdmissionRejected";
-        case Error::VerificationFailed:     return "VerificationFailed";
-        case Error::StepBudgetExceeded:     return "StepBudgetExceeded";
-        case Error::RingFull:               return "RingFull";
-        case Error::RingEmpty:              return "RingEmpty";
-        case Error::OutOfBounds:            return "OutOfBounds";
-        case Error::OutOfMemory:            return "OutOfMemory";
-        case Error::NotFound:               return "NotFound";
-        case Error::InvalidState:           return "InvalidState";
-        case Error::ArenaSealed:            return "ArenaSealed";
-        case Error::DmaInFlightQuarantined: return "DmaInFlightQuarantined";
-        case Error::NamespaceNotFound:      return "NamespaceNotFound";
-        case Error::LoanActive:             return "LoanActive";
+        case Error::None:                    return "None";
+        case Error::InvalidArgument:         return "InvalidArgument";
+        case Error::InvalidCapability:       return "InvalidCapability";
+        case Error::RevokedCapability:       return "RevokedCapability";
+        case Error::InsufficientRights:      return "InsufficientRights";
+        case Error::DomainMismatch:          return "DomainMismatch";
+        case Error::TableFull:               return "TableFull";
+        case Error::QuotaExceeded:           return "QuotaExceeded";
+        case Error::AdmissionRejected:       return "AdmissionRejected";
+        case Error::VerificationFailed:      return "VerificationFailed";
+        case Error::StepBudgetExceeded:      return "StepBudgetExceeded";
+        case Error::RingFull:                return "RingFull";
+        case Error::RingEmpty:               return "RingEmpty";
+        case Error::OutOfBounds:             return "OutOfBounds";
+        case Error::OutOfMemory:             return "OutOfMemory";
+        case Error::NotFound:                return "NotFound";
+        case Error::InvalidState:            return "InvalidState";
+        case Error::ArenaSealed:             return "ArenaSealed";
+        case Error::DmaInFlightQuarantined:  return "DmaInFlightQuarantined";
+        case Error::NamespaceNotFound:       return "NamespaceNotFound";
+        case Error::LoanActive:              return "LoanActive";
+        case Error::RtReserveProtected:      return "RtReserveProtected";
+        case Error::WxorXViolation:          return "WxorXViolation";
+        case Error::CrossCoreTargetRequired: return "CrossCoreTargetRequired";
     }
     return "UnknownError";
 }

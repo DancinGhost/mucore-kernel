@@ -26,10 +26,13 @@
 
 namespace mucore::core::mm {
 
-inline constexpr usize BITMAP_WORDS         = 64; // 64 * 64 = 4096 frames = 16 MiB pool
-inline constexpr usize MAX_FRAMES           = BITMAP_WORDS * 64;
-inline constexpr usize MAX_GRANT_ARENAS     = 32;
-inline constexpr usize MAX_PIPELINE_STAGES  = 6;
+inline constexpr usize BITMAP_WORDS           = 64; // 64 * 64 = 4096 frames = 16 MiB pool
+inline constexpr usize MAX_FRAMES             = BITMAP_WORDS * 64;
+inline constexpr usize MAX_GRANT_ARENAS       = 32;
+inline constexpr usize MAX_PIPELINE_STAGES    = 6;
+inline constexpr usize MAGAZINE_CAPACITY      = 64; // Per-CPU 0-lock hot frame cache (256 KiB)
+inline constexpr usize MAGAZINE_BATCH_SIZE    = 32; // Batch refill / drain quantum
+inline constexpr usize RT_EMERGENCY_WATERMARK = 8;  // Protected exclusively for Tier-0 Hard RT!
 
 enum class ArenaLifecycle : u8 {
     Free                 = 0,
@@ -84,6 +87,14 @@ struct ColocatedPipeline {
     u32            zero_ipc_hops{0}; // Counts stage transitions completed with 0 syscalls!
 };
 
+// Per-CPU 0-lock hot physical frame cache with Hard-RT emergency watermark
+struct LocalFrameMagazine {
+    PhysAddr frames[MAGAZINE_CAPACITY]{};
+    usize    count{0};
+    u64      local_fast_allocs{0};
+    u64      batch_refills{0};
+};
+
 struct MemoryTable {
     PhysPoolState   pool{};
     GrantArenaState arenas[MAX_GRANT_ARENAS]{};
@@ -96,7 +107,7 @@ struct MemoryTable {
 };
 
 // ============================================================================
-// PURE FUNCTIONAL CORE ALLOCATION, MPK SEALING & NT QUARANTINE OPERATIONS
+// PURE FUNCTIONAL CORE ALLOCATION, MAGAZINES, MPK SEALING & NT QUARANTINE
 // ============================================================================
 
 [[nodiscard]] constexpr Result<PhysAddr, Error> alloc_frame(PhysPoolState& pool) noexcept {
@@ -117,6 +128,43 @@ struct MemoryTable {
             return Result<PhysAddr, Error>::ok(
                 pool.base_addr.offset(static_cast<u64>(frame_idx) * PAGE_SIZE_4K)
             );
+        }
+    }
+
+    return Result<PhysAddr, Error>::err(Error::OutOfMemory);
+}
+
+// Allocate `pages` genuinely contiguous 4 KiB physical frames (safe under fragmentation!)
+[[nodiscard]] constexpr Result<PhysAddr, Error> alloc_contiguous_frames(
+    PhysPoolState& pool,
+    u32            pages
+) noexcept {
+    if (pages == 0 || pool.allocated_frames + pages > pool.total_frames) {
+        return Result<PhysAddr, Error>::err(
+            (pages == 0) ? Error::InvalidArgument : Error::OutOfMemory
+        );
+    }
+
+    u32 run_start = 0;
+    u32 run_len   = 0;
+    for (u32 f = 0; f < pool.total_frames; ++f) {
+        usize const w   = f / 64u;
+        u32 const   bit = f % 64u;
+        bool const  used = (pool.used_bitmap[w] & (1ULL << bit)) != 0ULL;
+        if (!used) {
+            if (run_len == 0) run_start = f;
+            ++run_len;
+            if (run_len == pages) {
+                for (u32 mark = run_start; mark < run_start + pages; ++mark) {
+                    pool.used_bitmap[mark / 64u] |= (1ULL << (mark % 64u));
+                }
+                pool.allocated_frames += pages;
+                return Result<PhysAddr, Error>::ok(
+                    pool.base_addr.offset(static_cast<u64>(run_start) * PAGE_SIZE_4K)
+                );
+            }
+        } else {
+            run_len = 0;
         }
     }
 
@@ -149,6 +197,69 @@ struct MemoryTable {
     return Result<Unit, Error>::ok(Unit{});
 }
 
+// 0-Lock O(1) Per-Core Magazine Pop:
+//   Tier-1 (`!is_hard_rt`) cannot consume the last `RT_EMERGENCY_WATERMARK` frames,
+//   guaranteeing Tier-0 Hard Real-Time paths never block on backing pool refills!
+[[nodiscard]] constexpr Result<PhysAddr, Error> alloc_from_magazine(
+    LocalFrameMagazine& mag,
+    bool                is_hard_rt
+) noexcept {
+    if (mag.count == 0) {
+        return Result<PhysAddr, Error>::err(Error::OutOfMemory);
+    }
+    if (!is_hard_rt && mag.count <= RT_EMERGENCY_WATERMARK) {
+        return Result<PhysAddr, Error>::err(Error::RtReserveProtected);
+    }
+    mag.local_fast_allocs += 1;
+    return Result<PhysAddr, Error>::ok(mag.frames[--mag.count]);
+}
+
+[[nodiscard]] constexpr Result<Unit, Error> free_to_magazine(
+    LocalFrameMagazine& mag,
+    PhysAddr            frame
+) noexcept {
+    if (!frame.is_page_aligned()) {
+        return Result<Unit, Error>::err(Error::InvalidArgument);
+    }
+    if (mag.count >= MAGAZINE_CAPACITY) {
+        return Result<Unit, Error>::err(Error::TableFull);
+    }
+    mag.frames[mag.count++] = frame;
+    return Result<Unit, Error>::ok(Unit{});
+}
+
+// Batch-refill up to `MAGAZINE_BATCH_SIZE` frames from shared `PhysPoolState` into `mag`
+[[nodiscard]] constexpr usize refill_magazine_batch(
+    LocalFrameMagazine& mag,
+    PhysPoolState&      pool
+) noexcept {
+    usize added = 0;
+    while (mag.count < MAGAZINE_CAPACITY && added < MAGAZINE_BATCH_SIZE) {
+        auto f = alloc_frame(pool);
+        if (f.is_err()) break;
+        mag.frames[mag.count++] = f.value();
+        ++added;
+    }
+    if (added > 0) {
+        mag.batch_refills += 1;
+    }
+    return added;
+}
+
+// Batch-drain `MAGAZINE_BATCH_SIZE` frames from full `mag` back to shared `PhysPoolState`
+[[nodiscard]] constexpr usize drain_magazine_batch(
+    LocalFrameMagazine& mag,
+    PhysPoolState&      pool
+) noexcept {
+    usize drained = 0;
+    while (mag.count > RT_EMERGENCY_WATERMARK && drained < MAGAZINE_BATCH_SIZE) {
+        PhysAddr const f = mag.frames[--mag.count];
+        (void)free_frame(pool, f);
+        ++drained;
+    }
+    return drained;
+}
+
 [[nodiscard]] constexpr Option<usize> find_arena_slot(
     MemoryTable const& mem,
     ArenaId            id
@@ -174,18 +285,11 @@ struct MemoryTable {
         return Result<ArenaId, Error>::err(Error::InvalidArgument);
     }
 
-    auto base_res = alloc_frame(mem.pool);
+    auto base_res = alloc_contiguous_frames(mem.pool, pages);
     if (base_res.is_err()) {
         return Result<ArenaId, Error>::err(base_res.error());
     }
     PhysAddr const base_phys = base_res.value();
-
-    for (u32 p = 1; p < pages; ++p) {
-        auto next_res = alloc_frame(mem.pool);
-        if (next_res.is_err()) {
-            return Result<ArenaId, Error>::err(next_res.error());
-        }
-    }
 
     for (usize i = 0; i < MAX_GRANT_ARENAS; ++i) {
         if (!mem.arenas[i].active) {

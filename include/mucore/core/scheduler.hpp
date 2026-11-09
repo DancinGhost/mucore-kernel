@@ -64,6 +64,8 @@ struct ThreadControlBlock {
     // L4-MCS Scheduling Context Loan tracking (strict conservation of CBS budget!)
     ThreadId    loaned_to{};        // Non-zero while this RT thread's budget is loaned out
     ThreadId    borrowed_from{};    // Non-zero while executing on a client's CBS loan
+    CpuId       borrowed_from_cpu{};
+    bool        has_remote_loan{false};
     SchedClass  saved_class{SchedClass::AsyncThroughput};
     u64         saved_budget_ns{0};
     TickNs      saved_deadline{};
@@ -272,6 +274,156 @@ struct SchedDecision {
     }
 
     return Result<ThreadId, Error>::ok(donor_id);
+}
+
+// ============================================================================
+// LOCK-FREE CROSS-CORE SMP PARCEL SCHEDULING PRIMITIVES
+// ============================================================================
+
+struct RemoteCbsLoan {
+    ThreadId donor_tid{};
+    CpuId    donor_cpu{};
+    ThreadId worker_tid{};
+    u64      donated_budget_ns{0};
+    TickNs   donated_deadline{};
+};
+
+struct RemoteCbsRefund {
+    ThreadId donor_tid{};
+    CpuId    donor_cpu{};
+    u64      leftover_budget_ns{0};
+};
+
+// Source Core: deducts `donor_tid`'s CBS budget locally (0 cross-core locks!)
+[[nodiscard]] constexpr Result<RemoteCbsLoan, Error> extract_cbs_loan_for_remote(
+    SchedTable& local_sched,
+    CpuId       local_cpu,
+    ThreadId    donor_tid,
+    ThreadId    remote_worker_tid
+) noexcept {
+    auto d_slot = find_thread_slot(local_sched, donor_tid);
+    if (d_slot.is_none()) {
+        return Result<RemoteCbsLoan, Error>::err(Error::NotFound);
+    }
+    ThreadControlBlock& donor = local_sched.threads[d_slot.value()];
+    if (donor.sched_class != SchedClass::IsochronousRt || donor.remaining_budget_ns == 0) {
+        return Result<RemoteCbsLoan, Error>::err(Error::InsufficientRights);
+    }
+    if (donor.loaned_to) {
+        return Result<RemoteCbsLoan, Error>::err(Error::LoanActive);
+    }
+
+    RemoteCbsLoan loan{
+        .donor_tid         = donor_tid,
+        .donor_cpu         = local_cpu,
+        .worker_tid        = remote_worker_tid,
+        .donated_budget_ns = donor.remaining_budget_ns,
+        .donated_deadline  = donor.abs_deadline,
+    };
+
+    donor.remaining_budget_ns = 0;
+    donor.loaned_to           = remote_worker_tid;
+    donor.state               = ThreadState::Blocked;
+    return Result<RemoteCbsLoan, Error>::ok(loan);
+}
+
+// Target Core: installs incoming `RemoteCbsLoan` parcel onto local `worker_tid`
+[[nodiscard]] constexpr Result<Unit, Error> apply_remote_cbs_loan(
+    SchedTable&          target_sched,
+    RemoteCbsLoan const& loan
+) noexcept {
+    auto w_slot = find_thread_slot(target_sched, loan.worker_tid);
+    if (w_slot.is_none()) {
+        return Result<Unit, Error>::err(Error::NotFound);
+    }
+    ThreadControlBlock& worker = target_sched.threads[w_slot.value()];
+    if (worker.borrowed_from) {
+        return Result<Unit, Error>::err(Error::LoanActive);
+    }
+
+    worker.saved_class         = worker.sched_class;
+    worker.saved_budget_ns     = worker.remaining_budget_ns;
+    worker.saved_deadline      = worker.abs_deadline;
+
+    worker.sched_class         = SchedClass::IsochronousRt;
+    worker.remaining_budget_ns = loan.donated_budget_ns;
+    worker.abs_deadline        = loan.donated_deadline;
+    worker.borrowed_from       = loan.donor_tid;
+    worker.borrowed_from_cpu   = loan.donor_cpu;
+    worker.has_remote_loan     = true;
+    if (worker.state == ThreadState::Blocked || worker.state == ThreadState::Throttled) {
+        worker.state = ThreadState::Ready;
+    }
+    return Result<Unit, Error>::ok(Unit{});
+}
+
+// Target Core: completes remote CBS work & packages leftover nanoseconds for `RefundRemoteCbs`
+[[nodiscard]] constexpr Result<RemoteCbsRefund, Error> finish_remote_cbs_loan(
+    SchedTable& target_sched,
+    ThreadId    worker_tid
+) noexcept {
+    auto w_slot = find_thread_slot(target_sched, worker_tid);
+    if (w_slot.is_none()) {
+        return Result<RemoteCbsRefund, Error>::err(Error::NotFound);
+    }
+    ThreadControlBlock& worker = target_sched.threads[w_slot.value()];
+    if (!worker.has_remote_loan || !worker.borrowed_from) {
+        return Result<RemoteCbsRefund, Error>::err(Error::InvalidState);
+    }
+
+    RemoteCbsRefund refund{
+        .donor_tid          = worker.borrowed_from,
+        .donor_cpu          = worker.borrowed_from_cpu,
+        .leftover_budget_ns = worker.remaining_budget_ns,
+    };
+
+    worker.sched_class         = worker.saved_class;
+    worker.remaining_budget_ns = worker.saved_budget_ns;
+    worker.abs_deadline        = worker.saved_deadline;
+    worker.borrowed_from       = ThreadId{0};
+    worker.borrowed_from_cpu   = CpuId{0};
+    worker.has_remote_loan     = false;
+    if (worker.sched_class == SchedClass::IsochronousRt && worker.remaining_budget_ns == 0) {
+        worker.state = ThreadState::Throttled;
+    }
+    return Result<RemoteCbsRefund, Error>::ok(refund);
+}
+
+// Source Core: receives `RemoteCbsRefund` parcel & wakes Hard-RT donor with exact unspent budget!
+[[nodiscard]] constexpr Result<Unit, Error> receive_remote_cbs_refund(
+    SchedTable&            local_sched,
+    RemoteCbsRefund const& refund
+) noexcept {
+    auto d_slot = find_thread_slot(local_sched, refund.donor_tid);
+    if (d_slot.is_none()) {
+        return Result<Unit, Error>::err(Error::NotFound);
+    }
+    ThreadControlBlock& donor = local_sched.threads[d_slot.value()];
+    donor.loaned_to            = ThreadId{0};
+    donor.remaining_budget_ns += refund.leftover_budget_ns;
+    donor.state                = (donor.remaining_budget_ns > 0)
+                                   ? ThreadState::Ready
+                                   : ThreadState::Throttled;
+    return Result<Unit, Error>::ok(Unit{});
+}
+
+// Tier-1 Only Rebalancing: extracts a Ready `AsyncThroughput` TCB for cross-core migration
+// (Tier-0 `IsochronousRt` threads are strictly rejected to preserve per-core 85% CBS admission!)
+[[nodiscard]] constexpr Result<ThreadControlBlock, Error> extract_async_thread_for_migration(
+    SchedTable& local_sched,
+    ThreadId    tid
+) noexcept {
+    auto slot_opt = find_thread_slot(local_sched, tid);
+    if (slot_opt.is_none()) {
+        return Result<ThreadControlBlock, Error>::err(Error::NotFound);
+    }
+    ThreadControlBlock& tcb = local_sched.threads[slot_opt.value()];
+    if (tcb.sched_class != SchedClass::AsyncThroughput || tcb.state != ThreadState::Ready) {
+        return Result<ThreadControlBlock, Error>::err(Error::InvalidState);
+    }
+    ThreadControlBlock snapshot = tcb;
+    tcb = ThreadControlBlock{};
+    return Result<ThreadControlBlock, Error>::ok(snapshot);
 }
 
 // Charge Ring-0 Kineticlet / IRQ execution time directly to owning RT thread's CBS budget

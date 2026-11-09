@@ -38,7 +38,8 @@ KERNEL_LDFLAGS := \
 
 HOST_CXXFLAGS := \
 	$(COMMON_CXXFLAGS) \
-	$(INCLUDES)
+	$(INCLUDES) \
+	-pthread
 
 KERNEL_ELF := $(BUILD_DIR)/mucore-x86_64.elf
 TEST_BIN   := $(BUILD_DIR)/mucore-tests
