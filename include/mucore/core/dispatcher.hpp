@@ -255,6 +255,81 @@ struct KernelState {
     return Result<Unit, Error>::err(Error::TableFull);
 }
 
+// ============================================================================
+// TEARDOWN COUNTERPARTS (cold path: used when a domain exits or is restarted)
+// ============================================================================
+
+// Close a conduit: drop its `FluxPort` binding (with any pending readiness) and free the slot.
+// Queued submissions and completions are discarded.
+constexpr Result<Unit, Error> close_conduit(KernelState& state, ConduitId id) noexcept {
+    auto c_idx = find_conduit_idx(state, id);
+    if (c_idx.is_none()) {
+        return Result<Unit, Error>::err(Error::NotFound);
+    }
+    flux::ConduitState& conduit = state.conduits[c_idx.value()];
+
+    auto p_idx = find_port_idx(state, conduit.bound_port);
+    if (p_idx.is_some()) {
+        port::FluxPortState& p    = state.ports[p_idx.value()];
+        u8 const             slot = conduit.port_bind_slot;
+        if (slot < port::MAX_BOUND_PER_PORT && p.bindings[slot].bound &&
+            p.bindings[slot].conduit == id) {
+            (void)port::unbind_port_slot(p, slot);
+        }
+    }
+
+    conduit = flux::ConduitState{};
+    return Result<Unit, Error>::ok(Unit{});
+}
+
+// Close every conduit that has `domain` on either end.
+constexpr u32 close_domain_conduits(KernelState& state, DomainId domain) noexcept {
+    u32 closed = 0;
+    for (usize i = 0; i < MAX_CONDUITS; ++i) {
+        flux::ConduitState const& c = state.conduits[i];
+        if (c.active && (c.producer == domain || c.consumer == domain)) {
+            (void)close_conduit(state, c.id);
+            ++closed;
+        }
+    }
+    return closed;
+}
+
+// Destroy a readiness port; conduits still attached to it are detached, not closed.
+constexpr Result<Unit, Error> destroy_flux_port(KernelState& state, PortId id) noexcept {
+    auto p_idx = find_port_idx(state, id);
+    if (p_idx.is_none()) {
+        return Result<Unit, Error>::err(Error::NotFound);
+    }
+    for (usize i = 0; i < MAX_CONDUITS; ++i) {
+        if (state.conduits[i].active && state.conduits[i].bound_port == id) {
+            state.conduits[i].bound_port     = PortId{0};
+            state.conduits[i].port_bind_slot = 0;
+        }
+    }
+    state.ports[p_idx.value()] = port::FluxPortState{};
+    return Result<Unit, Error>::ok(Unit{});
+}
+
+// Unbind the IRQ pacts and uninstall the Ring-0 Kineticlets owned by `domain`, so no
+// interrupt can be routed to (or charged against) a domain that no longer exists.
+constexpr u32 release_domain_fast_paths(KernelState& state, DomainId domain) noexcept {
+    u32 released = 0;
+    for (usize i = 0; i < MAX_IRQ_BINDINGS; ++i) {
+        if (state.irq_pacts[i].active && state.irq_pacts[i].driver_domain == domain) {
+            state.irq_pacts[i] = IrqPactBinding{};
+            ++released;
+        }
+    }
+    for (usize i = 0; i < MAX_KINETIC_SLOTS; ++i) {
+        if (state.kinetics[i].installed && state.kinetics[i].owner == domain) {
+            state.kinetics[i] = kinetic::KineticSlotState{};
+            ++released;
+        }
+    }
+    return released;
+}
+
 constexpr void append_sched_effects(
     KernelState&                state,
     EffectBatch&                effects,

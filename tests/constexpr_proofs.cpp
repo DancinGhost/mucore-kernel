@@ -7,8 +7,10 @@
 // ============================================================================
 
 #include "mucore/core/dispatcher.hpp"
+#include "mucore/core/init.hpp"
 #include "mucore/core/smp.hpp"
 #include "mucore/core/vmspace.hpp"
+#include "tests/init_fixture.hpp"
 
 namespace mucore::proofs {
 
@@ -475,5 +477,151 @@ consteval bool prove_smp_cross_core_cbs_and_replay() {
 
 static_assert(prove_smp_cross_core_cbs_and_replay(),
               "Compile-time proof failed: Cross-core SMP CBS loan parcel or shard replay broken!");
+
+// ----------------------------------------------------------------------------
+// Proof 10: Init — Manifest Verifier, Capability Wiring & Bounded Supervision
+// ----------------------------------------------------------------------------
+
+// (a) The planner resolves the clients-first fixture into a providers-first boot order
+//     and assigns one conduit per import.
+static_assert(fixture::PLAN.count == 4 && fixture::PLAN.conduit_count == 4 &&
+              fixture::PLAN.rt_util_ppm == 100'000ULL &&
+              fixture::PLAN.order[0] == fixture::NVME &&
+              fixture::PLAN.order[1] == fixture::BLKTRACE &&
+              fixture::PLAN.order[2] == fixture::VFS &&
+              fixture::PLAN.order[3] == fixture::SHELL,
+              "Compile-time proof failed: init boot order is not a topological sort!");
+
+// (b) Manifests that would be unsafe at run time are rejected inside the compiler.
+namespace bad {
+
+inline constexpr init::ServiceSpec CYCLE[] = {
+    {.name = "a", .domain = DomainId{2}, .thread = ThreadId{2},
+     .exports = {{.path = "/srv/a"}}, .imports = {{.path = "/srv/b"}}},
+    {.name = "b", .domain = DomainId{3}, .thread = ThreadId{3},
+     .exports = {{.path = "/srv/b"}}, .imports = {{.path = "/srv/a"}}},
+};
+
+inline constexpr init::ServiceSpec ESCALATION[] = {
+    {.name = "disk", .domain = DomainId{2}, .thread = ThreadId{2},
+     .exports = {{.path = "/dev/disk", .client_rights = cap::CapRights::Read}}},
+    {.name = "app", .domain = DomainId{3}, .thread = ThreadId{3},
+     .imports = {{.path = "/dev/disk", .rights = cap::CapRights::Read | cap::CapRights::Write}}},
+};
+
+inline constexpr init::ServiceSpec CLIENT_REVOKE[] = {
+    {.name = "disk", .domain = DomainId{2}, .thread = ThreadId{2},
+     .exports = {{.path = "/dev/disk"}}},
+    {.name = "app", .domain = DomainId{3}, .thread = ThreadId{3},
+     .imports = {{.path = "/dev/disk", .rights = cap::CapRights::Read | cap::CapRights::Revoke}}},
+};
+
+inline constexpr init::ServiceSpec RT_OVERCOMMIT[] = {
+    {.name = "rt-a", .domain = DomainId{2}, .thread = ThreadId{2},
+     .sched_class = sched::SchedClass::IsochronousRt,
+     .rt = {.wcet_ns = 500'000ULL, .period_ns = 1'000'000ULL}},
+    {.name = "rt-b", .domain = DomainId{3}, .thread = ThreadId{3},
+     .sched_class = sched::SchedClass::IsochronousRt,
+     .rt = {.wcet_ns = 400'000ULL, .period_ns = 1'000'000ULL}},
+};
+
+inline constexpr init::ServiceSpec DANGLING[] = {
+    {.name = "app", .domain = DomainId{2}, .thread = ThreadId{2},
+     .imports = {{.path = "/srv/nowhere"}}},
+};
+
+inline constexpr init::ServiceSpec SHARED_IRQ[] = {
+    {.name = "drv-a", .domain = DomainId{2}, .thread = ThreadId{2},
+     .grants = {{.kind = cap::CapObjectKind::IrqHook, .rights = cap::CapRights::Read,
+                 .object_id = 33}}},
+    {.name = "drv-b", .domain = DomainId{3}, .thread = ThreadId{3},
+     .grants = {{.kind = cap::CapObjectKind::IrqHook, .rights = cap::CapRights::Read,
+                 .object_id = 33}}},
+};
+
+inline constexpr init::ServiceSpec USURPER[] = {
+    {.name = "fake-init", .domain = init::INIT_DOMAIN, .thread = ThreadId{2}},
+};
+
+} // namespace bad
+
+static_assert(init::plan_boot(bad::CYCLE).error == init::PlanError::DependencyCycle);
+static_assert(init::plan_boot(bad::ESCALATION).error == init::PlanError::ImportExceedsExport);
+static_assert(init::plan_boot(bad::CLIENT_REVOKE).error == init::PlanError::BadImportRights);
+static_assert(init::plan_boot(bad::RT_OVERCOMMIT).error == init::PlanError::RtOverCommitted &&
+              init::plan_boot(bad::RT_OVERCOMMIT).offender == 1);
+static_assert(init::plan_boot(bad::DANGLING).error == init::PlanError::UnresolvedImport);
+static_assert(init::plan_boot(bad::SHARED_IRQ).error == init::PlanError::DuplicateExclusiveGrant);
+static_assert(init::plan_boot(bad::USURPER).error == init::PlanError::ReservedDomain);
+
+// (c) Booting the plan on a pristine kernel cannot fail, and supervision keeps the
+//     capability, namespace and CBS invariants across crashes.
+consteval bool prove_init_boot_and_supervision() {
+    KernelState     st{};
+    init::InitState ini{};
+    init::BootPlan const& plan = fixture::PLAN;
+
+    auto boot = init::boot_services(st, ini, plan, TickNs{0});
+    if (boot.is_err() || boot.value().started != 4u || boot.value().failed != 0u) return false;
+    if (st.sched.reserved_rt_ppm != 100'000ULL) return false;
+
+    // `vfs` reaches the disk through the interposer, with the direct endpoint as fallback.
+    auto traced = ns::resolve_path(st.namespaces, st.caps, fixture::VFS_DOM, "/dev/nvme0/ns1");
+    if (traced.is_err() || !(traced.value().conduit_id == fixture::VFS_TO_BLKTRACE) ||
+        traced.value().can_promote_hot || traced.value().union_alternatives != 1u) {
+        return false;
+    }
+    // `shell` was never given the disk: it is not in its namespace at all.
+    if (ns::resolve_path(st.namespaces, st.caps, fixture::SHELL_DOM, "/dev/nvme0").error() !=
+        Error::NamespaceNotFound) {
+        return false;
+    }
+
+    // Crash 1 of the interposer: restarted, the client's old token is dead, the path
+    // resolves through a fresh conduit.
+    cap::CapToken const old_tok = ini.services[fixture::VFS].import_caps[0];
+    auto first = init::supervise_domain_exit(st, ini, plan, fixture::BLKTRACE_DOM, TickNs{1'000});
+    if (first.verdict != init::Verdict::Restarted || first.restarts != 1u) return false;
+    if (cap::validate_capability(st.caps, fixture::VFS_DOM, old_tok,
+                                 cap::CapObjectKind::FluxConduit, cap::CapRights::Read).is_ok()) {
+        return false;
+    }
+    auto rewired = ns::resolve_path(st.namespaces, st.caps, fixture::VFS_DOM, "/dev/nvme0/ns1");
+    if (rewired.is_err() || !(rewired.value().conduit_id == fixture::VFS_TO_BLKTRACE) ||
+        rewired.value().conduit_cap == old_tok) {
+        return false;
+    }
+
+    // Crash 2 exhausts its budget: init gives up and the union falls back to the direct,
+    // hot-promotable driver endpoint without `vfs` being touched.
+    auto second = init::supervise_domain_exit(st, ini, plan, fixture::BLKTRACE_DOM, TickNs{2'000});
+    if (second.verdict != init::Verdict::GaveUp) return false;
+    if (sched::find_thread_slot(st.sched, fixture::BLKTRACE_TID).is_some()) return false;
+    auto direct = ns::resolve_path(st.namespaces, st.caps, fixture::VFS_DOM, "/dev/nvme0/ns1");
+    if (direct.is_err() || !(direct.value().conduit_id == fixture::VFS_TO_NVME) ||
+        !direct.value().can_promote_hot || direct.value().union_alternatives != 0u) {
+        return false;
+    }
+
+    // Crash of the Tier-0 driver: restarted, but with no budget until its next period,
+    // and the admitted bandwidth is neither leaked nor double-counted.
+    auto rt_restart = init::supervise_domain_exit(st, ini, plan, fixture::NVME_DOM, TickNs{3'000});
+    if (rt_restart.verdict != init::Verdict::Restarted) return false;
+    if (st.sched.reserved_rt_ppm != 100'000ULL) return false;
+    if (sched::schedule_at(st.sched, TickNs{4'000}).next_thread == fixture::NVME_TID) return false;
+    if (!(sched::schedule_at(st.sched, TickNs{3'000 + fixture::NVME_PERIOD_NS}).next_thread ==
+          fixture::NVME_TID)) {
+        return false;
+    }
+
+    // A critical service out of restarts halts the system instead of running degraded.
+    auto fatal = init::supervise_domain_exit(st, ini, plan, fixture::NVME_DOM, TickNs{9'000'000});
+    return fatal.verdict == init::Verdict::HaltSystem &&
+           ini.services[fixture::NVME].state == init::ServiceState::Failed &&
+           st.sched.reserved_rt_ppm == 0ULL;
+}
+
+static_assert(prove_init_boot_and_supervision(),
+              "Compile-time proof failed: init wiring or crash supervision broken!");
 
 } // namespace mucore::proofs

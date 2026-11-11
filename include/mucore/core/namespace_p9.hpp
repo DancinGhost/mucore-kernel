@@ -244,6 +244,48 @@ struct NamespaceTable {
     return Result<Unit, Error>::ok(Unit{});
 }
 
+// Compact out every mount of `domain` whose capability is no longer valid. `resolve_path`
+// already skips such mounts; pruning returns their table slots so the path can be re-bound.
+constexpr u32 prune_revoked_mounts(
+    NamespaceTable&      ns_table,
+    cap::CapTable const& cap_table,
+    DomainId             domain
+) noexcept {
+    for (usize d = 0; d < MAX_NAMESPACE_DOMAINS; ++d) {
+        DomainNamespace& dns = ns_table.domains[d];
+        if (!dns.initialized || !(dns.domain == domain)) continue;
+
+        usize write_pos = 0;
+        for (usize i = 0; i < dns.count; ++i) {
+            auto valid = cap::validate_capability(
+                cap_table, domain, dns.mounts[i].conduit_cap,
+                cap::CapObjectKind::FluxConduit, cap::CapRights::Read
+            );
+            if (valid.is_ok()) {
+                dns.mounts[write_pos++] = dns.mounts[i];
+            }
+        }
+        u32 const pruned = static_cast<u32>(dns.count - write_pos);
+        for (usize i = write_pos; i < dns.count; ++i) {
+            dns.mounts[i] = MountEntry{};
+        }
+        dns.count = write_pos;
+        return pruned;
+    }
+    return 0;
+}
+
+// Discard the whole private namespace of an exited domain.
+constexpr bool drop_domain_namespace(NamespaceTable& ns_table, DomainId domain) noexcept {
+    for (usize d = 0; d < MAX_NAMESPACE_DOMAINS; ++d) {
+        if (ns_table.domains[d].initialized && ns_table.domains[d].domain == domain) {
+            ns_table.domains[d] = DomainNamespace{};
+            return true;
+        }
+    }
+    return false;
+}
+
 // Resolve a human-readable path inside `caller`'s private namespace:
 //   - Longest matching prefix wins.
 //   - Among equal-length union prefixes, earlier mount order (`Before` > `After`) wins!

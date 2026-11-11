@@ -60,6 +60,43 @@ Combining *Ring-0 hot paths*, *Userspace drivers*, *Minimal context switching*, 
 
 ---
 
+## Init: Compile-Time Service Manifest & Crash Supervision
+
+`include/mucore/core/init.hpp` is the first holder of authority: it turns a static description of the system's services into live threads, capabilities, conduits and namespaces, then restarts services whose domain exits. It is a pure-core layer **above** the dispatcher — `KernelState` and `dispatch_event` gained no init fields and no init branches, so the IRQ, timer and Flux paths are unchanged.
+
+```cpp
+inline constexpr core::init::ServiceSpec SERVICES[] = {
+    {.name = "nvme", .domain = DomainId{2}, .thread = ThreadId{2},
+     .sched_class = core::sched::SchedClass::IsochronousRt,
+     .rt = {.wcet_ns = 100'000, .period_ns = 1'000'000}, .critical = true,
+     .grants  = {{.kind = CapObjectKind::IrqHook, .rights = Rights::Read | Rights::Write, .object_id = 32}},
+     .exports = {{.path = "/dev/nvme0", .client_rights = Rights::Read | Rights::Write | Rights::FastPromote}}},
+    {.name = "vfs", .domain = DomainId{3}, .thread = ThreadId{3},
+     .exports = {{.path = "/srv/vfs"}},
+     .imports = {{.path = "/dev/nvme0"}}},
+};
+inline constexpr core::init::BootPlan PLAN = core::init::compile_manifest(SERVICES);  // runs in the compiler
+```
+
+* **The manifest is checked by the compiler (`plan_boot` / `compile_manifest`).** Import paths are matched to exports, the boot order is topologically sorted, and a manifest with an import cycle, an import asking for more rights than the export offers, a client-held `Revoke` right, a doubly-granted IRQ line, or Tier-0 utilization above 85% does not build. The kernel image carries only the resolved `BootPlan` in `.rodata`; nothing is parsed, sorted or string-matched at boot.
+* **Wiring (`boot_services`).** Each service gets its thread (with CBS admission), its private grants, one `FluxPort` if it exports anything, and one dedicated SPSC conduit per import, mounted in its private Plan-9 namespace. A service sees only the paths its manifest entry imports. Every capability lives in the revocation group of the service that backs it.
+* **Supervision (`supervise_domain_exit`).** Init holds one `DomainControl` capability per service. One epoch bump on it invalidates everything the dead service held *and* every capability its clients held on it; its threads, conduits, port, IRQ pacts and Kineticlets are reclaimed, and a CBS loan it was running on goes back to the donor. Restart is immediate and bounded by `max_restarts`; after that the service is `Failed` (or the system halts if it is `critical`). Clients are not restarted: they are re-wired with fresh conduits, and union mounts fall through to the remaining providers while one is down. Requests in flight on the old conduits are lost.
+* **Real-time rule.** A restarted Tier-0 thread stays throttled until its next CBS period boundary, so a crash-looping driver can never spend more than its admitted budget.
+* **Replay.** `supervise_after_event` is the single entry used by both the live shell and `replay_supervised`, so a recorded trace reproduces every restart and every re-issued capability token.
+
+| What init costs | Amount |
+| :--- | :--- |
+| Hot paths (IRQ, timer, `FluxSubmit`, scheduler) | nothing added |
+| `.bss` | `InitState`: 88 bytes per service slot, 1.4 KiB total |
+| `.rodata` | resolved `BootPlan`: 3.6 KiB |
+| `.text` | about 14 KiB of boot and domain-exit code (`g++ -O2`) |
+| Capability slots | 1 per service (`DomainControl`) + 1 per grant, export port and import |
+| Work at run time | once at boot, then only when a domain exits |
+
+Until Phase 3 adds a Ring-3 ELF host, the services are domains without code of their own and supervision runs in the Ring-0 shell (`handle_domain_exit` in `kmain.cpp`, reachable through capability-gated syscall 5).
+
+---
+
 ## System Architecture
 
 ```mermaid
@@ -136,13 +173,15 @@ mucore-kernel/
 │   │   ├── vmspace.hpp            # 4-level x86_64 VmSpace mapper (W^X, MPK PTE[62:59], StrictKpti)
 │   │   ├── smp.hpp                # Per-CPU CpuShard, wait-free SmpMailMatrix, targeted PKRU & replay
 │   │   ├── effects.hpp            # Algebraic KernelEvent inputs & KernelEffect hardware outputs
-│   │   └── dispatcher.hpp         # Unified deterministic kernel transition engine
+│   │   ├── dispatcher.hpp         # Unified deterministic kernel transition engine
+│   │   └── init.hpp               # Init: consteval service manifest planner, wiring & crash supervision
 │   └── shell/                     # === IMPERATIVE SHELL INTERFACES ===
 │       ├── hal.hpp                # Zero-vtable `concept HalPlatform` & ImperativeKernelRuntime<Hal>
 │       ├── shared_conduit.hpp     # Cache-line aligned (__atomic acquire/release) wait-free SPSC ring
 │       └── trace_ring.hpp         # Lock-free Flight Recorder with deterministic time-travel replay
 ├── kernel/                        # === BARE-METAL RING-0 SMP IMPLEMENTATION ===
-│   ├── kmain.cpp                  # constinit Ring-0 BSP + Limine SMP AP bring-up & POST self-check
+│   ├── kmain.cpp                  # constinit Ring-0 BSP + Limine SMP AP bring-up, init boot & POST self-check
+│   ├── boot_manifest.hpp          # Boot service manifest, compiled to a BootPlan at build time
 │   └── arch/x86_64/
 │       ├── boot.S                 # Multi-core swapgs SYSCALL/SYSRETQ & 16B-aligned IDT ISR stubs
 │       ├── cpu.hpp                # SYSRET-ordered GDT, TSS, WRPKRU, x2APIC ICR IPI & PCID CR3
@@ -153,8 +192,9 @@ mucore-kernel/
 │       ├── linker.ld              # Higher-half (-2 GiB) W^X ELF64 linker script (.init_array banned!)
 │       └── serial.hpp             # Early 16550 UART (COM1) diagnostic console
 ├── tests/                         # === COMPILE-TIME PROOFS & CONCURRENT SMP SIMULATION SUITE ===
-│   ├── constexpr_proofs.cpp       # 9 consteval static_assert theorem suites verified inside compiler
-│   └── test_main.cpp              # 11 runtime suites including 4-OS-thread SMP sharding & replay
+│   ├── constexpr_proofs.cpp       # 10 consteval static_assert theorem suites verified inside compiler
+│   ├── init_fixture.hpp           # Four-service init manifest shared by the proofs and the host suite
+│   └── test_main.cpp              # 12 runtime suites including 4-OS-thread SMP sharding & replay
 └── Makefile                       # Builds bare-metal SMP ELF64 (`make kernel`) & suite (`make test`)
 ```
 
@@ -172,7 +212,7 @@ make CXX=clang++ all
 ```text
 ======================================================================
   μCore (mucore-kernel) — FCIS, Four-Lineage & SMP Verification Suite
-  Compile-Time `static_assert` Proofs (9 Theorem Suites): PASSED
+  Compile-Time `static_assert` Proofs (10 Theorem Suites): PASSED
 ======================================================================
 [TEST 1] Capabilities: Monotonicity, Surgical + Epoch Revoke & Slot GC...
   [PASS] Surgical + O(1) epoch revocation & zombie slot GC verified.
@@ -196,8 +236,10 @@ make CXX=clang++ all
   [PASS] 4-level VmSpace W^X/MPK/StrictKpti & Hard-RT Magazine reserve verified.
 [TEST 11] 4-OS-Thread SMP Sharding, CBS IPI Loans, PKRU & Per-Core Replay...
   [PASS] 4-thread SMP sharding, 160 magazine allocs, targeted PKRU & 4-core replay verified!
+[TEST 12] Init: Compile-Time Manifest, Capability Wiring & Crash Supervision...
+  [PASS] 4 services wired from a compile-time plan; 5 crashes -> 2 restarts, 3 given up; replay exact.
 ----------------------------------------------------------------------
-Summary: 11 passed, 0 failed.
+Summary: 12 passed, 0 failed.
 ```
 
 ---

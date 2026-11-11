@@ -12,10 +12,12 @@
 #include <string.h>
 
 #include "mucore/core/dispatcher.hpp"
+#include "mucore/core/init.hpp"
 #include "mucore/core/smp.hpp"
 #include "mucore/core/vmspace.hpp"
 #include "mucore/shell/hal.hpp"
 #include "mucore/shell/shared_conduit.hpp"
+#include "tests/init_fixture.hpp"
 
 namespace {
 
@@ -920,12 +922,225 @@ void test_concurrent_4thread_smp_sharding_and_replay() {
     ++g_passed;
 }
 
+// ----------------------------------------------------------------------------
+// Test 12: Init — Manifest Boot, Capability Wiring, Crash Supervision & Replay
+// ----------------------------------------------------------------------------
+bool init_tables_match(
+    KernelState const& a, init::InitState const& ia,
+    KernelState const& b, init::InitState const& ib
+) {
+    for (usize i = 0; i < init::MAX_SERVICES; ++i) {
+        init::ServiceRuntime const& x = ia.services[i];
+        init::ServiceRuntime const& y = ib.services[i];
+        if (x.state != y.state || x.restarts != y.restarts ||
+            !(x.control_cap == y.control_cap) || !(x.port_cap == y.port_cap)) {
+            return false;
+        }
+        for (usize g = 0; g < init::MAX_GRANTS_PER_SERVICE; ++g) {
+            if (!(x.grant_caps[g] == y.grant_caps[g])) return false;
+        }
+        for (usize k = 0; k < init::MAX_IMPORTS_PER_SERVICE; ++k) {
+            if (!(x.import_caps[k] == y.import_caps[k])) return false;
+        }
+    }
+    for (usize s = 0; s < cap::MAX_CAP_SLOTS; ++s) {
+        cap::CapEntry const& x = a.caps.slots[s];
+        cap::CapEntry const& y = b.caps.slots[s];
+        if (x.occupied != y.occupied || x.generation != y.generation ||
+            !(x.owner == y.owner) || x.object_id != y.object_id || x.rights != y.rights) {
+            return false;
+        }
+    }
+    for (usize g = 0; g < cap::MAX_REVOCATION_GROUPS; ++g) {
+        if (a.caps.group_epochs[g] != b.caps.group_epochs[g]) return false;
+    }
+    for (usize c = 0; c < MAX_CONDUITS; ++c) {
+        if (a.conduits[c].active != b.conduits[c].active ||
+            !(a.conduits[c].id == b.conduits[c].id)) {
+            return false;
+        }
+    }
+    return ia.restarts == ib.restarts && ia.failures == ib.failures &&
+           ia.exits_handled == ib.exits_handled;
+}
+
+void test_init_boot_and_supervision() {
+    printf("[TEST 12] Init: Compile-Time Manifest, Capability Wiring & Crash Supervision...\n");
+    using namespace mucore::fixture;
+
+    SimHal hal{};
+    shell::ImperativeKernelRuntime<SimHal> rt{hal};
+    KernelState&          st   = rt.state();
+    init::InitState       ini{};
+    init::BootPlan const& plan = PLAN;
+
+    // The live shell's domain-exit path: kernel teardown event, then init supervision.
+    auto crash = [&](DomainId dom, u64 at_ns) -> init::SuperviseOutcome {
+        KernelEvent const ev{
+            .kind          = EventKind::DomainCrashTeardown,
+            .timestamp     = TickNs{at_ns},
+            .caller_domain = dom,
+        };
+        if (rt.handle_event(ev).is_err()) return init::SuperviseOutcome{};
+        return init::supervise_after_event(st, ini, plan, ev);
+    };
+
+    // --- Boot -------------------------------------------------------------
+    auto boot = init::boot_services(st, ini, plan, TickNs{0});
+    MUCORE_CHECK(boot.is_ok() && boot.value().started == 4u && boot.value().failed == 0u,
+                 "All four manifest services started in dependency order");
+    MUCORE_CHECK(init::boot_services(st, ini, plan, TickNs{0}).error() == Error::InvalidState,
+                 "Init refuses to boot twice");
+    MUCORE_CHECK(st.sched.reserved_rt_ppm == 100'000ULL,
+                 "Tier-0 driver admitted with exactly its manifest bandwidth");
+
+    auto traced = ns::resolve_path(st.namespaces, st.caps, VFS_DOM, "/dev/nvme0/ns1");
+    MUCORE_CHECK(traced.is_ok() && traced.value().conduit_id == VFS_TO_BLKTRACE &&
+                 !traced.value().can_promote_hot && traced.value().union_alternatives == 1u &&
+                 strcmp(traced.value().rel_subpath.bytes, "/ns1") == 0,
+                 "vfs reaches /dev/nvme0 through the blktrace interposer, direct path as fallback");
+    MUCORE_CHECK(ns::resolve_path(st.namespaces, st.caps, SHELL_DOM, "/dev/nvme0").error() ==
+                 Error::NamespaceNotFound,
+                 "shell has no path to the disk: it was never granted one");
+    MUCORE_CHECK(cap::validate_capability(st.caps, SHELL_DOM, traced.value().conduit_cap,
+                                          cap::CapObjectKind::FluxConduit, cap::CapRights::Read)
+                     .error() == Error::DomainMismatch,
+                 "A capability minted for vfs is useless to shell");
+
+    // A submission over the wired conduit reaches the provider's port with the right cookie.
+    MUCORE_CHECK(rt.handle_event(KernelEvent{
+        .kind = EventKind::FluxSubmit, .timestamp = TickNs{100},
+        .caller_domain = VFS_DOM, .cap_token = traced.value().conduit_cap,
+        .submission = flux::FluxSubmission{.user_tag = 7},
+    }).is_ok(), "vfs submits to blktrace over its init-wired conduit");
+    auto blk_port = find_port_idx(st, plan.services[BLKTRACE].port);
+    MUCORE_CHECK(blk_port.is_some(), "blktrace owns a readiness port");
+    auto ready = port::pop_ready_conduit(st.ports[blk_port.value()]);
+    MUCORE_CHECK(ready.is_some() && ready.value().conduit == VFS_TO_BLKTRACE &&
+                 ready.value().user_key == init::port_user_key(VFS, 0),
+                 "blktrace's port reports the ready client conduit and its cookie");
+
+    // The driver uses the capabilities init granted it to install its Ring-0 fast path.
+    kinetic::KineticProgram ack{};
+    ack.insns[0] = kinetic::dsl::ret(kinetic::ReturnVerdict::CompleteFastPath);
+    ack.len      = 1;
+    MUCORE_CHECK(install_kineticlet(st, NVME_DOM, ini.services[NVME].grant_caps[0],
+                                    KineticId{1}, ack).is_ok(),
+                 "nvme installs a Kineticlet with its granted KineticSlot capability");
+    MUCORE_CHECK(bind_irq_pact(st, NVME_DOM, ini.services[NVME].grant_caps[1], IrqPactBinding{
+        .active        = true,
+        .irq           = IrqLine{static_cast<u16>(NVME_IRQ)},
+        .driver_domain = NVME_DOM,
+        .driver_thread = NVME_TID,
+        .fast_kinetic  = KineticId{1},
+    }).is_ok(), "nvme binds its IRQ with its granted IrqHook capability");
+    MUCORE_CHECK(install_kineticlet(st, VFS_DOM, ini.services[NVME].grant_caps[0],
+                                    KineticId{2}, ack).is_err(),
+                 "vfs cannot use the driver's KineticSlot capability");
+
+    // --- Crash 1: interposer dies while holding a CBS loan from the driver ----
+    MUCORE_CHECK(sched::donate_cbs_context(st.sched, NVME_TID, BLKTRACE_TID).is_ok(),
+                 "nvme lends its CBS context to the blktrace worker");
+    cap::CapToken const dead_tok = ini.services[VFS].import_caps[0];
+
+    auto first = crash(BLKTRACE_DOM, 10'000);
+    MUCORE_CHECK(first.verdict == init::Verdict::Restarted && first.restarts == 1u,
+                 "blktrace restarted on its first crash");
+    // (Rejected as revoked, or as a stale generation once the restart has recycled its slot.)
+    MUCORE_CHECK(cap::validate_capability(st.caps, VFS_DOM, dead_tok,
+                                          cap::CapObjectKind::FluxConduit, cap::CapRights::Read)
+                     .is_err(),
+                 "vfs's capability on the dead instance no longer validates");
+    u32 const donor = sched::find_thread_slot(st.sched, NVME_TID).value();
+    MUCORE_CHECK(!st.sched.threads[donor].loaned_to &&
+                 st.sched.threads[donor].state == sched::ThreadState::Ready &&
+                 st.sched.threads[donor].remaining_budget_ns == NVME_WCET_NS,
+                 "The dead worker's borrowed CBS budget went back to its donor");
+    auto rewired = ns::resolve_path(st.namespaces, st.caps, VFS_DOM, "/dev/nvme0/ns1");
+    MUCORE_CHECK(rewired.is_ok() && rewired.value().conduit_id == VFS_TO_BLKTRACE &&
+                 !(rewired.value().conduit_cap == dead_tok) &&
+                 rewired.value().union_alternatives == 1u,
+                 "vfs was re-wired to the new blktrace instance without restarting");
+    auto fresh_port = find_port_idx(st, plan.services[BLKTRACE].port);
+    MUCORE_CHECK(fresh_port.is_some() && !port::has_pending(st.ports[fresh_port.value()]),
+                 "The restarted provider starts with an empty port");
+
+    // --- Crash 2: restart budget exhausted, union falls back ------------------
+    auto second = crash(BLKTRACE_DOM, 20'000);
+    MUCORE_CHECK(second.verdict == init::Verdict::GaveUp &&
+                 ini.services[BLKTRACE].state == init::ServiceState::Failed,
+                 "blktrace is given up on after max_restarts");
+    MUCORE_CHECK(sched::find_thread_slot(st.sched, BLKTRACE_TID).is_none() &&
+                 find_conduit_idx(st, VFS_TO_BLKTRACE).is_none() &&
+                 find_conduit_idx(st, BLKTRACE_TO_NVME).is_none() &&
+                 find_port_idx(st, plan.services[BLKTRACE].port).is_none(),
+                 "A failed service leaves no thread, conduit or port behind");
+    auto direct = ns::resolve_path(st.namespaces, st.caps, VFS_DOM, "/dev/nvme0/ns1");
+    MUCORE_CHECK(direct.is_ok() && direct.value().conduit_id == VFS_TO_NVME &&
+                 direct.value().can_promote_hot && direct.value().union_alternatives == 0u,
+                 "vfs falls back to the direct hot-promotable driver endpoint");
+    MUCORE_CHECK(crash(BLKTRACE_DOM, 21'000).verdict == init::Verdict::Unmanaged,
+                 "An exit report for a service that is not running is ignored");
+
+    // --- Crash 3: Tier-0 driver ------------------------------------------------
+    auto rt_restart = crash(NVME_DOM, 30'000);
+    MUCORE_CHECK(rt_restart.verdict == init::Verdict::Restarted, "nvme restarted");
+    MUCORE_CHECK(find_kinetic_idx(st, KineticId{1}).is_none() && !st.irq_pacts[0].active,
+                 "The dead driver's Kineticlet and IRQ pact were released");
+    MUCORE_CHECK(rt.handle_event(KernelEvent{
+        .kind = EventKind::HardwareIrq, .timestamp = TickNs{31'000},
+        .irq_line = IrqLine{static_cast<u16>(NVME_IRQ)},
+    }).error() == Error::NotFound, "An IRQ for the dead instance is not routed anywhere");
+    MUCORE_CHECK(st.sched.reserved_rt_ppm == 100'000ULL,
+                 "Restart neither leaks nor double-counts admitted RT bandwidth");
+    u32 const reborn = sched::find_thread_slot(st.sched, NVME_TID).value();
+    MUCORE_CHECK(st.sched.threads[reborn].state == sched::ThreadState::Throttled &&
+                 st.sched.threads[reborn].remaining_budget_ns == 0ULL,
+                 "The restarted RT thread gets no budget inside the crashed period");
+    MUCORE_CHECK(!(sched::schedule_at(st.sched, TickNs{40'000}).next_thread == NVME_TID),
+                 "It is not scheduled before its next period boundary");
+    MUCORE_CHECK(sched::schedule_at(st.sched, TickNs{30'000 + NVME_PERIOD_NS}).next_thread ==
+                 NVME_TID,
+                 "It runs again once the CBS period boundary replenishes it");
+    MUCORE_CHECK(rt.handle_event(KernelEvent{
+        .kind = EventKind::FluxSubmit, .timestamp = TickNs{1'100'000},
+        .caller_domain = VFS_DOM, .cap_token = ini.services[VFS].import_caps[1],
+        .submission = flux::FluxSubmission{.user_tag = 8},
+    }).is_ok(), "vfs talks to the restarted driver over its re-issued capability");
+
+    // --- Policies ---------------------------------------------------------------
+    MUCORE_CHECK(crash(SHELL_DOM, 1'200'000).verdict == init::Verdict::GaveUp &&
+                 ini.services[SHELL].restarts == 0u,
+                 "A RestartPolicy::Never service is not restarted");
+    auto fatal = crash(NVME_DOM, 1'300'000);
+    MUCORE_CHECK(fatal.verdict == init::Verdict::HaltSystem && st.sched.reserved_rt_ppm == 0ULL,
+                 "A critical service out of restarts asks the shell to halt");
+    MUCORE_CHECK(ini.exits_handled == 5u && ini.restarts == 2u && ini.failures == 3u &&
+                 ini.wiring_failures == 0u,
+                 "Supervision telemetry matches the crash history");
+
+    // --- Replay: boot a second kernel from the same plan and feed it the trace --
+    KernelState     replay{};
+    init::InitState replay_ini{};
+    MUCORE_CHECK(init::boot_services(replay, replay_ini, plan, TickNs{0}).is_ok(),
+                 "Replay kernel booted from the same plan");
+    auto replayed = init::replay_supervised(rt.trace(), replay, replay_ini, plan);
+    MUCORE_CHECK(replayed.is_ok() && replayed.value() == rt.trace().total_recorded(),
+                 "Every recorded event replayed");
+    MUCORE_CHECK(init_tables_match(st, ini, replay, replay_ini),
+                 "Replay reproduced every restart, capability token and conduit bit-for-bit");
+
+    printf("  [PASS] 4 services wired from a compile-time plan; %u crashes -> %u restarts, "
+           "%u given up; replay exact.\n", ini.exits_handled, ini.restarts, ini.failures);
+    ++g_passed;
+}
+
 } // namespace
 
 int main() {
     printf("======================================================================\n");
     printf("  μCore (mucore-kernel) — FCIS, Four-Lineage & SMP Verification Suite\n");
-    printf("  Compile-Time `static_assert` Proofs (9 Theorem Suites): PASSED\n");
+    printf("  Compile-Time `static_assert` Proofs (10 Theorem Suites): PASSED\n");
     printf("======================================================================\n");
 
     test_capabilities();
@@ -939,6 +1154,7 @@ int main() {
     test_l4_mcs_async_cbs_donation();
     test_vmspace_and_percore_magazines();
     test_concurrent_4thread_smp_sharding_and_replay();
+    test_init_boot_and_supervision();
 
     printf("----------------------------------------------------------------------\n");
     printf("Summary: %d passed, %d failed.\n", g_passed, g_failed);

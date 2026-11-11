@@ -7,6 +7,7 @@
 // ============================================================================
 
 #include "mucore/core/dispatcher.hpp"
+#include "mucore/core/init.hpp"
 #include "mucore/core/smp.hpp"
 #include "mucore/core/vmspace.hpp"
 #include "mucore/shell/hal.hpp"
@@ -17,6 +18,7 @@
 #include "kernel/arch/x86_64/limine_proto.hpp"
 #include "kernel/arch/x86_64/percpu.hpp"
 #include "kernel/arch/x86_64/serial.hpp"
+#include "kernel/boot_manifest.hpp"
 
 // ----------------------------------------------------------------------------
 // Freestanding Compiler ABI Primitives (Mandatory for -ffreestanding GCC/Clang)
@@ -106,6 +108,16 @@ constinit u32                                    g_online_cpu_count{0};
 constinit X86Hal                                 g_hal{};
 constinit shell::ImperativeKernelRuntime<X86Hal> g_kernel{g_hal};
 
+// Init's run-time state: 88 bytes per service. The manifest itself is `boot::PLAN` in `.rodata`.
+constinit core::init::InitState                  g_init{};
+constinit core::smp::ColdTicketLock              g_init_lock{};
+
+[[noreturn]] void halt_forever() noexcept {
+    for (;;) {
+        asm volatile("cli; hlt");
+    }
+}
+
 // Ring an x2APIC `VEC_SMP_PARCEL_IPI` doorbell to every remote CPU set in `cpu_mask`
 inline void notify_remote_cpus_ipi(u64 cpu_mask) noexcept {
     if (!g_hal.is_hardware_live()) return;
@@ -142,49 +154,110 @@ inline void notify_remote_cpus_ipi(u64 cpu_mask) noexcept {
     }
 }
 
+// Init: wire every service of the compile-time `boot::PLAN` into the kernel tables
+// (threads, private grants, ports, per-import conduits, Plan-9 namespaces).
+void run_init_boot(TickNs now) noexcept {
+    using namespace mucore::core;
+    SerialCom1::puts("[mucore] init: starting ");
+    SerialCom1::write_u64(boot::PLAN.count);
+    SerialCom1::puts(" services from the compile-time boot plan...\n");
+
+    auto report = init::boot_services(g_kernel.state(), g_init, boot::PLAN, now);
+
+    for (usize n = 0; n < boot::PLAN.count; ++n) {
+        usize const                 idx = boot::PLAN.order[n];
+        init::PlannedService const& svc = boot::PLAN.services[idx];
+        SerialCom1::puts("[mucore] init:   ");
+        SerialCom1::puts(svc.name);
+        SerialCom1::puts(" domain=");
+        SerialCom1::write_u64(svc.domain.raw);
+        SerialCom1::puts(" imports=");
+        SerialCom1::write_u64(svc.import_count);
+        switch (g_init.services[idx].state) {
+            case init::ServiceState::Running: SerialCom1::puts(" running\n");     break;
+            case init::ServiceState::Failed:  SerialCom1::puts(" FAILED\n");      break;
+            case init::ServiceState::Stopped: SerialCom1::puts(" not started\n"); break;
+        }
+    }
+
+    if (report.is_err()) {
+        SerialCom1::puts("[mucore] PANIC: critical service failed to start: ");
+        SerialCom1::puts(error_name(report.error()));
+        SerialCom1::puts("\n");
+        halt_forever();
+    }
+}
+
+// A protection domain exited: run the kernel's crash teardown event, then let init decide.
+// Cold path; serialized by `g_init_lock`.
+u64 handle_domain_exit(DomainId domain, TickNs now) noexcept {
+    using namespace mucore::core;
+    KernelEvent const ev{
+        .kind          = EventKind::DomainCrashTeardown,
+        .timestamp     = now,
+        .caller_domain = domain,
+    };
+
+    g_init_lock.lock();
+    auto res = g_kernel.handle_event(ev);
+    init::SuperviseOutcome outcome{};
+    if (res.is_ok()) {
+        outcome = init::supervise_after_event(g_kernel.state(), g_init, boot::PLAN, ev);
+    }
+    g_init_lock.unlock();
+
+    if (res.is_err()) {
+        return static_cast<u64>(res.error());
+    }
+    if (outcome.verdict == init::Verdict::Unmanaged) {
+        return 0ULL;
+    }
+
+    g_serial_lock.lock();
+    SerialCom1::puts("[mucore] init: ");
+    SerialCom1::puts(boot::PLAN.services[outcome.service].name);
+    switch (outcome.verdict) {
+        case init::Verdict::Restarted:  SerialCom1::puts(" exited, restarted (");         break;
+        case init::Verdict::GaveUp:     SerialCom1::puts(" exited, given up (");          break;
+        case init::Verdict::HaltSystem: SerialCom1::puts(" exited, CRITICAL, halting ("); break;
+        case init::Verdict::Unmanaged:  break;
+    }
+    SerialCom1::write_u64(outcome.restarts);
+    SerialCom1::puts("/");
+    SerialCom1::write_u64(boot::PLAN.services[outcome.service].max_restarts);
+    SerialCom1::puts(" restarts used)\n");
+    g_serial_lock.unlock();
+
+    if (outcome.verdict == init::Verdict::HaltSystem) {
+        halt_forever();
+    }
+    return 0ULL;
+}
+
 // Boot-time Functional Core, VmSpace W^X/KPTI, and SMP Sharding Power-On Self-Test
-void run_boot_post() noexcept {
+void run_boot_post(TickNs now) noexcept {
     using namespace mucore::core;
     SerialCom1::puts("[mucore] Running Functional Core + SMP + VmSpace POST...\n");
 
     KernelState& st = g_kernel.state();
-    DomainId const drv_dom{1};
-    ThreadId const drv_tid{1};
 
-    // 1. Admit Hard Real-Time Isochronous Driver Control Budget (100us every 1ms = 10.0%)
-    auto tid_res = sched::spawn_thread(
-        st.sched,
-        drv_tid,
-        drv_dom,
-        sched::SchedClass::IsochronousRt,
-        sched::RtParams{.wcet_ns = 100'000ULL, .period_ns = 1'000'000ULL},
-        TickNs{0}
+    // 1. The driver domain, its Tier-0 CBS thread (100us every 1ms = 10.0%) and its
+    //    Kineticlet-slot and IRQ capabilities were all created by init from the manifest.
+    init::PlannedService const& nvme = boot::PLAN.services[boot::NVME];
+    DomainId const      drv_dom = nvme.domain;
+    ThreadId const      drv_tid = nvme.thread;
+    cap::CapToken const kin_cap = g_init.services[boot::NVME].grant_caps[boot::NVME_GRANT_KINETIC];
+    cap::CapToken const irq_cap = g_init.services[boot::NVME].grant_caps[boot::NVME_GRANT_IRQ];
+
+    // 2. A client resolves the driver through its own init-built namespace.
+    auto disk = ns::resolve_path(
+        st.namespaces, st.caps, boot::PLAN.services[boot::VFS].domain, "/dev/nvme0"
     );
-    if (tid_res.is_err()) {
-        SerialCom1::puts("[mucore] PANIC: RT CBS admission failed!\n");
-        return;
+    if (disk.is_ok() && disk.value().can_promote_hot) {
+        SerialCom1::puts("[mucore] init: vfs:/dev/nvme0 -> nvme conduit ");
+        SerialCom1::write_hex(disk.value().conduit_id.raw);
+        SerialCom1::puts(" (hot-promotable)\n");
     }
-
-    // 2. Mint Capabilities for Ring-0 Kineticlet Slot & IRQ 32 (NVMe MSI-X0)
-    auto kin_cap_mut = cap::plan_mint_root(
-        st.caps,
-        drv_dom,
-        cap::CapObjectKind::KineticSlot,
-        cap::CapRights::ExecuteRing0 | cap::CapRights::Read | cap::CapRights::Write,
-        1ULL,
-        cap::RevocationGroupId{1}
-    );
-    if (kin_cap_mut.is_ok()) cap::apply_mutation(st.caps, kin_cap_mut.value());
-
-    auto irq_cap_mut = cap::plan_mint_root(
-        st.caps,
-        drv_dom,
-        cap::CapObjectKind::IrqHook,
-        cap::CapRights::Read | cap::CapRights::Write,
-        32ULL,
-        cap::RevocationGroupId{1}
-    );
-    if (irq_cap_mut.is_ok()) cap::apply_mutation(st.caps, irq_cap_mut.value());
 
     // 3. Install Verified Ring-0 Kineticlet Fast-Path
     kinetic::KineticProgram prog{};
@@ -201,7 +274,7 @@ void run_boot_post() noexcept {
     prog.len      = 10;
 
     auto proof = install_kineticlet(
-        st, drv_dom, kin_cap_mut.value().minted_token, KineticId{1}, prog
+        st, drv_dom, kin_cap, KineticId{static_cast<u32>(boot::NVME_KINETIC_SLOT)}, prog
     );
     if (proof.is_ok()) {
         SerialCom1::puts("[mucore] Kineticlet #1 verified! WCET = ");
@@ -212,20 +285,20 @@ void run_boot_post() noexcept {
     }
 
     (void)open_conduit(st, ConduitId{1}, drv_dom, drv_dom, true);
-    (void)bind_irq_pact(st, drv_dom, irq_cap_mut.value().minted_token, IrqPactBinding{
+    (void)bind_irq_pact(st, drv_dom, irq_cap, IrqPactBinding{
         .active        = true,
-        .irq           = IrqLine{32},
+        .irq           = IrqLine{static_cast<u16>(boot::NVME_IRQ_LINE)},
         .driver_domain = drv_dom,
         .driver_thread = drv_tid,
         .conduit       = ConduitId{1},
-        .fast_kinetic  = KineticId{1},
+        .fast_kinetic  = KineticId{static_cast<u32>(boot::NVME_KINETIC_SLOT)},
     });
 
     // 4. Fire healthy IRQ -> handled 100% in Ring 0 with ZERO context switch!
     (void)g_kernel.handle_event(KernelEvent{
         .kind            = EventKind::HardwareIrq,
-        .timestamp       = TickNs{1'000},
-        .irq_line        = IrqLine{32},
+        .timestamp       = now,
+        .irq_line        = IrqLine{static_cast<u16>(boot::NVME_IRQ_LINE)},
         .irq_status_word = 0x0001ULL,
     });
 
@@ -235,7 +308,7 @@ void run_boot_post() noexcept {
         g_vm_pool.nodes[kpml4.value()].entries[256] = 0x0000'0000'0010'0103ULL; // HHDM Global
         g_vm_pool.nodes[kpml4.value()].entries[511] = 0x0000'0000'0020'0103ULL; // Trampoline
         auto sandbox_vm = vm::create_domain_vmspace(
-            g_vm_pool, kpml4.value(), DomainId{2}, vm::KptiMode::StrictKpti
+            g_vm_pool, kpml4.value(), DomainId{99}, vm::KptiMode::StrictKpti
         );
         auto wx_reject = vm::encode_leaf_pte(
             VirtAddr{0x40'0000ULL}, PhysAddr{0x20'0000ULL},
@@ -337,6 +410,25 @@ extern "C" mucore::u64 mucore_syscall_entry_c(
             notify_remote_cpus_ipi(ipi_mask);
         }
         return 0ULL;
+    }
+
+    // Syscall 5: Supervisor-Reported Domain Exit -> crash teardown + init supervision.
+    // The caller must present the target service's `DomainControl` capability (init mints
+    // exactly one per service), so no domain can take another down merely by naming it.
+    if (op == 5ULL) {
+        auto control = core::cap::validate_capability(
+            g_kernel.state().caps,
+            DomainId{static_cast<u32>(arg0)},
+            core::cap::CapToken{arg1},
+            core::cap::CapObjectKind::DomainControl,
+            core::cap::CapRights::Revoke
+        );
+        if (control.is_err()) {
+            return static_cast<u64>(control.error());
+        }
+        return handle_domain_exit(
+            DomainId{static_cast<u32>(control.value().object_id)}, now
+        );
     }
 
     return static_cast<u64>(Error::InvalidArgument);
@@ -457,7 +549,9 @@ extern "C" [[noreturn]] void kmain() noexcept {
     SerialCom1::write_u64(__atomic_load_n(&g_online_cpu_count, __ATOMIC_ACQUIRE));
     SerialCom1::puts("\n");
 
-    run_boot_post();
+    TickNs const boot_time{rdtsc_ordered()};
+    run_init_boot(boot_time);
+    run_boot_post(boot_time);
 
     g_hal.set_hardware_live(true);
     SerialCom1::puts("[mucore] Entering tickless multi-core Imperative Shell loop.\n");

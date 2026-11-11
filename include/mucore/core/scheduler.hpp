@@ -187,6 +187,27 @@ struct SchedDecision {
     return Result<ThreadId, Error>::err(Error::TableFull);
 }
 
+// Hold a freshly spawned Tier-0 thread back until its first replenishment boundary.
+// A supervisor restarting a crashed RT thread uses this so the new incarnation cannot
+// spend a second budget inside the period its predecessor already ran in; the existing
+// `schedule_at` replenishment step releases it at `replenish_at` (spawn time + period).
+[[nodiscard]] constexpr Result<Unit, Error> defer_budget_to_next_period(
+    SchedTable& table,
+    ThreadId    tid
+) noexcept {
+    auto slot = find_thread_slot(table, tid);
+    if (slot.is_none()) {
+        return Result<Unit, Error>::err(Error::NotFound);
+    }
+    ThreadControlBlock& tcb = table.threads[slot.value()];
+    if (tcb.sched_class != SchedClass::IsochronousRt || tcb.borrowed_from) {
+        return Result<Unit, Error>::err(Error::InvalidState);
+    }
+    tcb.remaining_budget_ns = 0;
+    tcb.state               = ThreadState::Throttled;
+    return Result<Unit, Error>::ok(Unit{});
+}
+
 // L4-MCS Scheduling Context Donation:
 //   Atomically transfers `donor_tid`'s CBS deadline & remaining budget to `worker_tid`
 //   so a Userspace Driver / Server executes Urgent-RT requests with zero priority inversion!
@@ -274,6 +295,42 @@ struct SchedDecision {
     }
 
     return Result<ThreadId, Error>::ok(donor_id);
+}
+
+// Remove every thread of an exited domain and settle its CPU-time claims:
+//   - a dying worker running on a borrowed CBS context returns the unspent budget to its donor,
+//   - a dying donor's outstanding loan is recalled so the worker drops back to its own class,
+//   - admitted Tier-0 bandwidth is released for re-admission.
+// A loan taken from another core cannot be refunded here: that needs a `RefundRemoteCbs`
+// parcel, which only the SMP shard layer can send.
+constexpr u32 reap_domain_threads(SchedTable& table, DomainId domain) noexcept {
+    if (!domain) return 0;
+
+    u32 reaped = 0;
+    for (u32 i = 0; i < MAX_THREADS; ++i) {
+        ThreadControlBlock& tcb = table.threads[i];
+        if (!tcb.occupied || !(tcb.domain == domain)) continue;
+
+        if (tcb.borrowed_from && !tcb.has_remote_loan) {
+            (void)return_cbs_context(table, tcb.id);
+        }
+        if (tcb.loaned_to) {
+            auto w_slot = find_thread_slot(table, tcb.loaned_to);
+            if (w_slot.is_some() && table.threads[w_slot.value()].borrowed_from == tcb.id) {
+                (void)return_cbs_context(table, tcb.loaned_to);
+            }
+        }
+
+        table.reserved_rt_ppm -= (tcb.util_ppm <= table.reserved_rt_ppm)
+                                     ? tcb.util_ppm
+                                     : table.reserved_rt_ppm;
+        if (table.current_thread == tcb.id) {
+            table.current_thread = ThreadId{0};
+        }
+        tcb = ThreadControlBlock{};
+        ++reaped;
+    }
+    return reaped;
 }
 
 // ============================================================================

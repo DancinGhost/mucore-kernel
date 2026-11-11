@@ -73,6 +73,22 @@ struct FluxPortState {
     return Result<u8, Error>::err(Error::TableFull);
 }
 
+// Release a binding slot and drop any readiness it had signalled, so a closed conduit
+// can never be popped from the port afterwards.
+[[nodiscard]] constexpr Result<Unit, Error> unbind_port_slot(
+    FluxPortState& port,
+    u8             bind_slot
+) noexcept {
+    if (!port.active || bind_slot >= MAX_BOUND_PER_PORT || !port.bindings[bind_slot].bound) {
+        return Result<Unit, Error>::err(Error::InvalidArgument);
+    }
+    u64 const bit = (1ULL << bind_slot);
+    port.urgent_ready_bitmap &= ~bit;
+    port.normal_ready_bitmap &= ~bit;
+    port.bindings[bind_slot]  = PortBinding{};
+    return Result<Unit, Error>::ok(Unit{});
+}
+
 // O(1) idempotent readiness signal (zero overflow risk under burst floods!)
 [[nodiscard]] constexpr Result<Unit, Error> signal_port_slot(
     FluxPortState& port,

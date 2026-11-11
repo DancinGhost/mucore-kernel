@@ -44,6 +44,9 @@ HOST_CXXFLAGS := \
 KERNEL_ELF := $(BUILD_DIR)/mucore-x86_64.elf
 TEST_BIN   := $(BUILD_DIR)/mucore-tests
 
+# The kernel is header-only apart from three translation units: rebuild them when any header changes.
+HEADERS := $(shell find include kernel tests -name '*.hpp')
+
 .PHONY: all kernel test check clean
 
 all: kernel test
@@ -54,10 +57,10 @@ $(BUILD_DIR):
 $(BUILD_DIR)/boot.o: kernel/arch/x86_64/boot.S | $(BUILD_DIR)
 	$(CXX) -mcmodel=kernel -fno-pic -fno-pie -c $< -o $@
 
-$(BUILD_DIR)/kmain.o: kernel/kmain.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/kmain.o: kernel/kmain.cpp $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(KERNEL_CXXFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/constexpr_proofs_kern.o: tests/constexpr_proofs.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/constexpr_proofs_kern.o: tests/constexpr_proofs.cpp $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(KERNEL_CXXFLAGS) -c $< -o $@
 
 $(KERNEL_ELF): $(BUILD_DIR)/boot.o $(BUILD_DIR)/kmain.o $(BUILD_DIR)/constexpr_proofs_kern.o kernel/arch/x86_64/linker.ld
@@ -66,7 +69,7 @@ $(KERNEL_ELF): $(BUILD_DIR)/boot.o $(BUILD_DIR)/kmain.o $(BUILD_DIR)/constexpr_p
 
 kernel: $(KERNEL_ELF)
 
-$(TEST_BIN): tests/test_main.cpp tests/constexpr_proofs.cpp | $(BUILD_DIR)
+$(TEST_BIN): tests/test_main.cpp tests/constexpr_proofs.cpp $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(HOST_CXXFLAGS) tests/test_main.cpp tests/constexpr_proofs.cpp -o $@
 
 test: $(TEST_BIN)
