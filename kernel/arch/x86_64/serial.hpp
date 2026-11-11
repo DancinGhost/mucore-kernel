@@ -4,22 +4,9 @@
 // ============================================================================
 
 #include "mucore/types.hpp"
+#include "kernel/arch/x86_64/cpu.hpp"
 
 namespace mucore::arch::x86_64 {
-
-inline void outb(u16 port, u8 val) noexcept {
-    asm volatile("outb %0, %1" : : "a"(val), "Nd"(port) : "memory");
-}
-
-[[nodiscard]] inline u8 inb(u16 port) noexcept {
-    u8 ret = 0;
-    asm volatile("inb %1, %0" : "=a"(ret) : "Nd"(port) : "memory");
-    return ret;
-}
-
-inline void io_wait() noexcept {
-    outb(0x80, 0);
-}
 
 class SerialCom1 {
 public:
@@ -69,6 +56,21 @@ public:
         for (int shift = 60; shift >= 0; shift -= 4) {
             putc(HEX[(val >> shift) & 0xFULL]);
         }
+    }
+
+    [[nodiscard]] static bool has_rx() noexcept {
+        return (inb(BASE + 5) & 0x01u) != 0;
+    }
+
+    [[nodiscard]] static char getc() noexcept {
+        return static_cast<char>(inb(BASE + 0));
+    }
+
+    [[nodiscard]] static char getc_blocking() noexcept {
+        while (!has_rx()) {
+            asm volatile("pause");
+        }
+        return getc();
     }
 
 private:

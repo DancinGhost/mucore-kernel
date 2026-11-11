@@ -30,8 +30,11 @@ inline constexpr u32 MSR_IA32_FS_BASE        = 0xC000'0100u;
 inline constexpr u32 MSR_IA32_GS_BASE        = 0xC000'0101u;
 inline constexpr u32 MSR_IA32_KERNEL_GS_BASE = 0xC000'0102u;
 inline constexpr u32 MSR_IA32_TSC_DEADLINE   = 0x0000'06E0u;
+inline constexpr u32 MSR_X2APIC_TPR          = 0x0000'0808u; // Task Priority Register
 inline constexpr u32 MSR_X2APIC_EOI          = 0x0000'080Bu;
+inline constexpr u32 MSR_X2APIC_SVR          = 0x0000'080Fu; // Spurious Interrupt Vector Register
 inline constexpr u32 MSR_X2APIC_ICR          = 0x0000'0830u; // 64-bit x2APIC IPI command MSR!
+inline constexpr u32 MSR_X2APIC_LVT_TIMER    = 0x0000'0832u; // LVT Timer Register
 
 inline constexpr u64 EFER_SCE              = 1ULL << 0;  // System Call Extensions
 inline constexpr u64 RFLAGS_IF             = 1ULL << 9;  // Mask IF on SYSCALL entry
@@ -125,6 +128,109 @@ inline void send_x2apic_ipi(u32 dest_lapic_id, u8 vector) noexcept {
                     (1ULL << 14) | // Level = Assert
                     static_cast<u64>(vector);
     wrmsr(MSR_X2APIC_ICR, icr);
+}
+
+// Enable Local x2APIC with Spurious Vector (bit 8 = Software Enable)
+inline void enable_x2apic_software(u8 spurious_vec = 255) noexcept {
+    wrmsr(MSR_X2APIC_SVR, (1ULL << 8) | static_cast<u64>(spurious_vec));
+    // Clear TPR to accept all interrupt priorities
+    wrmsr(MSR_X2APIC_TPR, 0ULL);
+}
+
+// Arm x2APIC LVT Timer in TSC-Deadline Mode (Intel SDM Vol. 3A 10.5.4.1)
+inline void init_x2apic_tsc_deadline(u8 timer_vec) noexcept {
+    // Bits 18:17 = 10b (TSC-Deadline mode), Bit 16 = 0 (unmasked), Bits 7:0 = vector
+    u64 const lvt = (1ULL << 18) | static_cast<u64>(timer_vec);
+    wrmsr(MSR_X2APIC_LVT_TIMER, lvt);
+}
+
+// Port I/O Primitives
+inline void outb(u16 port, u8 val) noexcept {
+    asm volatile("outb %0, %1" : : "a"(val), "Nd"(port) : "memory");
+}
+
+[[nodiscard]] inline u8 inb(u16 port) noexcept {
+    u8 ret = 0;
+    asm volatile("inb %1, %0" : "=a"(ret) : "Nd"(port) : "memory");
+    return ret;
+}
+
+inline void io_wait() noexcept {
+    outb(0x80, 0);
+}
+
+// System Reset & Halt Helpers
+inline void system_halt() noexcept {
+    for (;;) {
+        asm volatile("cli; hlt");
+    }
+}
+
+inline void system_reset_8042(DescriptorPtr const* null_idtr = nullptr) noexcept {
+    // 1. Keyboard Controller (8042) Pulse Reset (Port 0x64, Command 0xFE)
+    outb(0x64, 0xFE);
+    io_wait();
+
+    // 2. Triple fault fallback
+    if (null_idtr != nullptr) {
+        asm volatile("lidt (%0); int $3" : : "r"(null_idtr));
+    } else {
+        DescriptorPtr const zero_idtr{.limit = 0, .base = 0};
+        asm volatile("lidt (%0); int $3" : : "r"(&zero_idtr));
+    }
+
+    system_halt();
+}
+
+// TSC Cycle-to-Nanosecond Fixed-Point Scaling
+struct TscClockScale {
+    u64 mult{1000};             // Fixed-point factor: ns = (ticks * mult) >> shift
+    u32 shift{20};              // 20-bit fixed-point fractional precision
+    u64 tsc_hz{1'000'000'000ULL}; // Calibrated TSC frequency in Hz
+};
+
+[[nodiscard]] constexpr TickNs tsc_to_ns(u64 ticks, TscClockScale const& scale) noexcept {
+    return TickNs{(ticks * scale.mult) >> scale.shift};
+}
+
+[[nodiscard]] constexpr u64 ns_to_tsc(TickNs ns, TscClockScale const& scale) noexcept {
+    if (scale.mult == 0) return ns.raw;
+    return (ns.raw << scale.shift) / scale.mult;
+}
+
+// Freestanding CPUID-based TSC frequency calibrator
+inline TscClockScale calibrate_tsc() noexcept {
+    TscClockScale scale{};
+    u32 eax = 0, ebx = 0, ecx = 0, edx = 0;
+
+    // Check CPUID Leaf 0x16 (Processor Frequency Information)
+    asm volatile(
+        "cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(0x16u), "c"(0u)
+    );
+
+    u64 const base_mhz = eax & 0xFFFFu;
+    if (base_mhz >= 100 && base_mhz <= 10'000) {
+        scale.tsc_hz = base_mhz * 1'000'000ULL;
+    } else {
+        // Fallback: Check CPUID Leaf 0x15 (Crystal Clock Ratio)
+        asm volatile(
+            "cpuid"
+            : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+            : "a"(0x15u), "c"(0u)
+        );
+        if (eax != 0 && ebx != 0 && ecx != 0) {
+            scale.tsc_hz = (static_cast<u64>(ecx) * ebx) / eax;
+        } else {
+            // Nominal reference fallback: 2.4 GHz typical modern x86_64 core
+            scale.tsc_hz = 2'400'000'000ULL;
+        }
+    }
+
+    scale.shift = 20;
+    scale.mult  = (1'000'000'000ULL << 20) / scale.tsc_hz;
+    return scale;
 }
 
 extern "C" void x86_64_load_gdt_and_tss(DescriptorPtr const* gdtr, u16 cs_sel, u16 ds_sel, u16 tss_sel) noexcept;

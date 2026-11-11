@@ -43,13 +43,17 @@ HOST_CXXFLAGS := \
 
 KERNEL_ELF := $(BUILD_DIR)/mucore-x86_64.elf
 TEST_BIN   := $(BUILD_DIR)/mucore-tests
+SHELL_BIN  := $(BUILD_DIR)/mucore-shell
+ASAN_BIN   := $(BUILD_DIR)/mucore-tests-asan
+TSAN_BIN   := $(BUILD_DIR)/mucore-tests-tsan
+FUZZ_BIN   := $(BUILD_DIR)/mucore-fuzz
 
 # The kernel is header-only apart from three translation units: rebuild them when any header changes.
 HEADERS := $(shell find include kernel tests -name '*.hpp')
 
-.PHONY: all kernel test check clean
+.PHONY: all kernel test shell test-asan test-tsan fuzz test-fuzz check clean
 
-all: kernel test
+all: kernel test shell
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
@@ -75,7 +79,34 @@ $(TEST_BIN): tests/test_main.cpp tests/constexpr_proofs.cpp $(HEADERS) | $(BUILD
 test: $(TEST_BIN)
 	@./$(TEST_BIN)
 
-check: all
+$(SHELL_BIN): tests/shell_main.cpp $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(HOST_CXXFLAGS) tests/shell_main.cpp -o $@
+
+shell: $(SHELL_BIN)
+
+$(ASAN_BIN): tests/test_main.cpp tests/constexpr_proofs.cpp $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(HOST_CXXFLAGS) -fsanitize=address,undefined tests/test_main.cpp tests/constexpr_proofs.cpp -o $@
+
+test-asan: $(ASAN_BIN)
+	@echo "[TEST] Running AddressSanitizer & UndefinedBehaviorSanitizer suite..."
+	@./$(ASAN_BIN)
+
+$(TSAN_BIN): tests/test_main.cpp tests/constexpr_proofs.cpp $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(HOST_CXXFLAGS) -fsanitize=thread -Wno-tsan tests/test_main.cpp tests/constexpr_proofs.cpp -o $@
+
+test-tsan: $(TSAN_BIN)
+	@echo "[TEST] Running ThreadSanitizer SMP concurrency suite..."
+	@./$(TSAN_BIN)
+
+$(FUZZ_BIN): tests/fuzz_main.cpp $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(HOST_CXXFLAGS) tests/fuzz_main.cpp -o $@
+
+fuzz: $(FUZZ_BIN)
+	@./$(FUZZ_BIN)
+
+test-fuzz: fuzz
+
+check: all test-asan test-tsan fuzz
 
 clean:
 	rm -rf $(BUILD_DIR)

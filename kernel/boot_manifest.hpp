@@ -18,7 +18,7 @@ namespace mucore::boot {
 
 namespace Rights = core::cap::CapRights;
 
-inline constexpr u64 NVME_IRQ_LINE     = 32;
+inline constexpr u64 NVME_IRQ_LINE     = 48; // Vector 48 (decoupled from VEC_APIC_TIMER = 32!)
 inline constexpr u64 NVME_KINETIC_SLOT = 1;
 
 inline constexpr core::init::ServiceSpec SERVICES[] = {

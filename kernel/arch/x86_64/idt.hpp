@@ -15,11 +15,14 @@
 
 namespace mucore::arch::x86_64 {
 
-inline constexpr u8 VEC_DOUBLE_FAULT   = 8;
-inline constexpr u8 VEC_GP_FAULT       = 13;
-inline constexpr u8 VEC_PAGE_FAULT     = 14;
-inline constexpr u8 VEC_APIC_TIMER     = 32;
-inline constexpr u8 VEC_SMP_PARCEL_IPI = 33;
+inline constexpr u8 VEC_DOUBLE_FAULT     = 8;
+inline constexpr u8 VEC_GP_FAULT         = 13;
+inline constexpr u8 VEC_PAGE_FAULT       = 14;
+inline constexpr u8 VEC_APIC_TIMER       = 32;
+inline constexpr u8 VEC_SMP_PARCEL_IPI   = 33;
+inline constexpr u8 VEC_DEVICE_IRQ_BASE  = 48; // Base vector for external PCIe / MSI-X / IOAPIC interrupts
+inline constexpr u8 VEC_DEVICE_IRQ_COUNT = 16;
+inline constexpr u8 VEC_SPURIOUS         = 255;
 
 struct [[gnu::packed]] IdtGate64 {
     u16 offset_low{0};
@@ -43,6 +46,10 @@ void isr_stub_gp() noexcept;
 void isr_stub_pf() noexcept;
 void isr_stub_timer() noexcept;
 void isr_stub_smp_ipi() noexcept;
+void isr_stub_irq48() noexcept;
+void isr_stub_irq49() noexcept;
+void isr_stub_irq50() noexcept;
+void isr_stub_irq51() noexcept;
 void isr_stub_spurious() noexcept;
 }
 
@@ -68,6 +75,10 @@ inline void build_shared_idt(IdtTable& idt) noexcept {
     set_idt_gate(idt, VEC_PAGE_FAULT,     &isr_stub_pf, 0);
     set_idt_gate(idt, VEC_APIC_TIMER,     &isr_stub_timer, 0);
     set_idt_gate(idt, VEC_SMP_PARCEL_IPI, &isr_stub_smp_ipi, 0);
+    set_idt_gate(idt, VEC_DEVICE_IRQ_BASE + 0, &isr_stub_irq48, 0);
+    set_idt_gate(idt, VEC_DEVICE_IRQ_BASE + 1, &isr_stub_irq49, 0);
+    set_idt_gate(idt, VEC_DEVICE_IRQ_BASE + 2, &isr_stub_irq50, 0);
+    set_idt_gate(idt, VEC_DEVICE_IRQ_BASE + 3, &isr_stub_irq51, 0);
 }
 
 inline void load_idt_on_current_cpu(IdtTable const& idt) noexcept {

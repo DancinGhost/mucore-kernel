@@ -15,8 +15,10 @@
 #include "mucore/core/init.hpp"
 #include "mucore/core/smp.hpp"
 #include "mucore/core/vmspace.hpp"
+#include "mucore/shell/cli.hpp"
 #include "mucore/shell/hal.hpp"
 #include "mucore/shell/shared_conduit.hpp"
+#include "kernel/boot_manifest.hpp"
 #include "tests/init_fixture.hpp"
 
 namespace {
@@ -1135,6 +1137,148 @@ void test_init_boot_and_supervision() {
     ++g_passed;
 }
 
+// ----------------------------------------------------------------------------
+// Test 13: Interactive Command Shell & Diagnostics REPL Execution
+// ----------------------------------------------------------------------------
+void test_interactive_command_shell() {
+    printf("[TEST 13] Interactive Command Shell: REPL Commands, Supervision & IRQ Fast-Path...\n");
+    SimHal hal{};
+    shell::ImperativeKernelRuntime<SimHal> rt{hal};
+    init::InitState                        ini{};
+    smp::SmpNodeState                      smp{};
+
+    MUCORE_CHECK(init::boot_services(rt.state(), ini, boot::PLAN, TickNs{1'000'000ULL}).is_ok(),
+                 "Shell booted services from boot::PLAN");
+
+    // Prime Kineticlet
+    init::PlannedService const& nvme = boot::PLAN.services[boot::NVME];
+    cap::CapToken const kin_cap = ini.services[boot::NVME].grant_caps[boot::NVME_GRANT_KINETIC];
+    cap::CapToken const irq_cap = ini.services[boot::NVME].grant_caps[boot::NVME_GRANT_IRQ];
+
+    kinetic::KineticProgram prog{};
+    prog.insns[0] = kinetic::dsl::load_imm(4, 0x8000u);
+    prog.insns[1] = kinetic::dsl::mov(5, 0);
+    prog.insns[2] = kinetic::dsl::bit_and(5, 4);
+    prog.insns[3] = kinetic::dsl::jump_if_eq(5, 4, 5);
+    prog.insns[4] = kinetic::dsl::load_state(6, 0);
+    prog.insns[5] = kinetic::dsl::load_imm(7, 1);
+    prog.insns[6] = kinetic::dsl::add(6, 7);
+    prog.insns[7] = kinetic::dsl::store_state(0, 6);
+    prog.insns[8] = kinetic::dsl::ret(kinetic::ReturnVerdict::CompleteFastPath);
+    prog.insns[9] = kinetic::dsl::ret(kinetic::ReturnVerdict::EscalateToUserspace);
+    prog.len      = 10;
+
+    MUCORE_CHECK(install_kineticlet(
+        rt.state(), nvme.domain, kin_cap, KineticId{static_cast<u32>(boot::NVME_KINETIC_SLOT)}, prog
+    ).is_ok(), "Kineticlet installed for shell test");
+    MUCORE_CHECK(open_conduit(rt.state(), ConduitId{1}, nvme.domain, nvme.domain, true).is_ok(),
+                 "Conduit opened");
+    MUCORE_CHECK(bind_irq_pact(rt.state(), nvme.domain, irq_cap, IrqPactBinding{
+        .active        = true,
+        .irq           = IrqLine{static_cast<u16>(boot::NVME_IRQ_LINE)},
+        .driver_domain = nvme.domain,
+        .driver_thread = nvme.thread,
+        .conduit       = ConduitId{1},
+        .fast_kinetic  = KineticId{static_cast<u32>(boot::NVME_KINETIC_SLOT)},
+    }).is_ok(), "IRQ pact bound");
+
+    smp.shards[0].online = true;
+    smp.shards[0].cpu_id = CpuId{0};
+    MUCORE_CHECK(smp::alloc_shard_frame(smp, CpuId{0}, true).is_ok(), "Magazine primed");
+
+    shell::CommandShell<SimHal> cmd_shell{rt, ini, boot::PLAN, &smp};
+    shell::StringBuffer<4096> buf{};
+
+    auto run_cmd = [&](const char* cmd_str) {
+        buf.clear();
+        char line[128]{};
+        usize i = 0;
+        while (cmd_str[i] != '\0' && i + 1 < sizeof(line)) {
+            line[i] = cmd_str[i];
+            ++i;
+        }
+        line[i] = '\0';
+        cmd_shell.execute_line(line, buf.writer());
+    };
+
+    // 1. help
+    run_cmd("help");
+    MUCORE_CHECK(strstr(buf.data, "Interactive Diagnostic Shell") != nullptr, "help command executed");
+
+    // 2. version
+    run_cmd("version");
+    MUCORE_CHECK(strstr(buf.data, "Four Synthesized Lineages") != nullptr, "version command executed");
+
+    // 3. services
+    run_cmd("services");
+    MUCORE_CHECK(strstr(buf.data, "nvme") != nullptr && strstr(buf.data, "vfs") != nullptr,
+                 "services command lists manifest services");
+
+    // 4. ps
+    run_cmd("ps");
+    MUCORE_CHECK(strstr(buf.data, "IsochronousRt") != nullptr, "ps command lists Tier-0 RT threads");
+
+    // 5. ns
+    run_cmd("ns");
+    MUCORE_CHECK(strstr(buf.data, "/dev/nvme0") != nullptr, "ns command lists per-domain namespaces");
+
+    // 6. resolve
+    run_cmd("resolve 3 /dev/nvme0");
+    MUCORE_CHECK(strstr(buf.data, "CanPromoteHot: true") != nullptr, "resolve command resolves path");
+
+    // 7. smp
+    run_cmd("smp");
+    MUCORE_CHECK(strstr(buf.data, "8 frames") != nullptr, "smp command reports magazine & watermark");
+
+    // 8. mem
+    run_cmd("mem");
+    MUCORE_CHECK(strstr(buf.data, "4096") != nullptr, "mem command reports physical frame capacity");
+
+    // 9. irq fast
+    u64 const fast_before = rt.state().telemetry.ring0_fast_handled;
+    run_cmd("irq fast");
+    MUCORE_CHECK(strstr(buf.data, "CompleteFastPath") != nullptr, "irq fast executes Kineticlet in Ring 0");
+    MUCORE_CHECK(rt.state().telemetry.ring0_fast_handled == fast_before + 1,
+                 "telemetry tracks fast IRQ dispatch");
+
+    // 10. irq fault
+    u64 const esc_before = rt.state().telemetry.ring3_escalations;
+    run_cmd("irq fault");
+    MUCORE_CHECK(strstr(buf.data, "EscalateToUserspace") != nullptr, "irq fault detects error bit");
+    MUCORE_CHECK(rt.state().telemetry.ring3_escalations == esc_before + 1,
+                 "telemetry tracks Ring-3 escalation");
+
+    // 11. crash supervision
+    run_cmd("crash vfs");
+    MUCORE_CHECK(strstr(buf.data, "RESTARTED via epoch bump") != nullptr,
+                 "crash vfs triggers supervisor restart");
+    MUCORE_CHECK(ini.services[boot::VFS].restarts == 1, "vfs restart counter bumped to 1");
+
+    // 12. bench
+    run_cmd("bench");
+    MUCORE_CHECK(strstr(buf.data, "Context switches emitted: 0") != nullptr,
+                 "bench verifies 0 switches in Ring 0");
+
+    // 13. echo & clear
+    run_cmd("echo hello mucore");
+    MUCORE_CHECK(strstr(buf.data, "hello mucore") != nullptr, "echo works");
+    run_cmd("clear");
+    MUCORE_CHECK(strstr(buf.data, "\033[2J") != nullptr, "clear emits ANSI escape");
+
+    // 14. caps
+    run_cmd("caps");
+    MUCORE_CHECK(strstr(buf.data, "DomainControl") != nullptr && strstr(buf.data, "Total active capabilities") != nullptr,
+                 "caps command lists capability slots");
+
+    // 15. trace
+    run_cmd("trace");
+    MUCORE_CHECK(strstr(buf.data, "Total Flight Recorder events logged") != nullptr,
+                 "trace command reports Flight Recorder events");
+
+    printf("  [PASS] 15 shell commands verified; REPL output, supervision & IRQs exact.\n");
+    ++g_passed;
+}
+
 } // namespace
 
 int main() {
@@ -1155,6 +1299,7 @@ int main() {
     test_vmspace_and_percore_magazines();
     test_concurrent_4thread_smp_sharding_and_replay();
     test_init_boot_and_supervision();
+    test_interactive_command_shell();
 
     printf("----------------------------------------------------------------------\n");
     printf("Summary: %d passed, %d failed.\n", g_passed, g_failed);

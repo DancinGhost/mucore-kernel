@@ -167,6 +167,10 @@ ISR_DISPATCH isr_stub_gp,       13, 1, mucore_exception_handler_c
 ISR_DISPATCH isr_stub_pf,       14, 1, mucore_exception_handler_c
 ISR_DISPATCH isr_stub_timer,    32, 0, mucore_irq_vector_c
 ISR_DISPATCH isr_stub_smp_ipi,  33, 0, mucore_irq_vector_c
+ISR_DISPATCH isr_stub_irq48,    48, 0, mucore_irq_vector_c
+ISR_DISPATCH isr_stub_irq49,    49, 0, mucore_irq_vector_c
+ISR_DISPATCH isr_stub_irq50,    50, 0, mucore_irq_vector_c
+ISR_DISPATCH isr_stub_irq51,    51, 0, mucore_irq_vector_c
 ISR_DISPATCH isr_stub_spurious, 255, 0, mucore_irq_vector_c
 
 .section .note.GNU-stack, "", @progbits

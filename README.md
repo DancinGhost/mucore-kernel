@@ -177,6 +177,7 @@ mucore-kernel/
 │   │   └── init.hpp               # Init: consteval service manifest planner, wiring & crash supervision
 │   └── shell/                     # === IMPERATIVE SHELL INTERFACES ===
 │       ├── hal.hpp                # Zero-vtable `concept HalPlatform` & ImperativeKernelRuntime<Hal>
+│       ├── cli.hpp                # Zero-heap interactive command shell & diagnostics REPL
 │       ├── shared_conduit.hpp     # Cache-line aligned (__atomic acquire/release) wait-free SPSC ring
 │       └── trace_ring.hpp         # Lock-free Flight Recorder with deterministic time-travel replay
 ├── kernel/                        # === BARE-METAL RING-0 SMP IMPLEMENTATION ===
@@ -186,7 +187,7 @@ mucore-kernel/
 │       ├── boot.S                 # Multi-core swapgs SYSCALL/SYSRETQ & 16B-aligned IDT ISR stubs
 │       ├── cpu.hpp                # SYSRET-ordered GDT, TSS, WRPKRU, x2APIC ICR IPI & PCID CR3
 │       ├── percpu.hpp             # Per-CPU %gs block, Ring-0 & IST1 stacks, GDT/TSS per core
-│       ├── idt.hpp                # 256-gate 64-bit IDT (#DF IST1, #GP, #PF, APIC Timer & SMP IPI)
+│       ├── idt.hpp                # 256-gate 64-bit IDT (#DF IST1, #GP, #PF, APIC Timer, SMP IPI, Device IRQs)
 │       ├── hal_x86_64.hpp         # Bare-metal x86_64 HalPlatform (x2APIC, TSC-Deadline, PKRU, PCID)
 │       ├── limine_proto.hpp       # Standalone Limine HHDM, Memmap & SMP x2APIC protocol requests
 │       ├── linker.ld              # Higher-half (-2 GiB) W^X ELF64 linker script (.init_array banned!)
@@ -194,8 +195,10 @@ mucore-kernel/
 ├── tests/                         # === COMPILE-TIME PROOFS & CONCURRENT SMP SIMULATION SUITE ===
 │   ├── constexpr_proofs.cpp       # 10 consteval static_assert theorem suites verified inside compiler
 │   ├── init_fixture.hpp           # Four-service init manifest shared by the proofs and the host suite
-│   └── test_main.cpp              # 12 runtime suites including 4-OS-thread SMP sharding & replay
-└── Makefile                       # Builds bare-metal SMP ELF64 (`make kernel`) & suite (`make test`)
+│   ├── test_main.cpp              # 13 runtime suites including 4-OS-thread SMP sharding, shell & replay
+│   ├── shell_main.cpp             # Host interactive shell runner for local CLI debugging
+│   └── fuzz_main.cpp              # Deterministic state-machine fuzz harness (millions of events/sec)
+└── Makefile                       # Bare-metal kernel, host tests, ASan/TSan sanitizers & fuzz targets
 ```
 
 ---
@@ -203,9 +206,18 @@ mucore-kernel/
 ## Building & Running Verification
 
 ```bash
-# Build freestanding x86_64 SMP ELF64 kernel + run all compile-time & 4-thread SMP suites
+# Build freestanding x86_64 SMP ELF64 kernel + host tests + diagnostic shell
 make all
 make CXX=clang++ all
+
+# Run full quality gate: unit tests, ASan, UBSan, TSan and fuzz harness
+make check
+
+# Launch host interactive diagnostic shell
+./build/mucore-shell
+
+# Run the high-speed dispatcher fuzz harness (millions of events/sec)
+make fuzz
 ```
 
 ### Verification Output
@@ -238,8 +250,10 @@ make CXX=clang++ all
   [PASS] 4-thread SMP sharding, 160 magazine allocs, targeted PKRU & 4-core replay verified!
 [TEST 12] Init: Compile-Time Manifest, Capability Wiring & Crash Supervision...
   [PASS] 4 services wired from a compile-time plan; 5 crashes -> 2 restarts, 3 given up; replay exact.
+[TEST 13] Interactive Command Shell: REPL Commands, Supervision & IRQ Fast-Path...
+  [PASS] 15 shell commands verified; REPL output, supervision & IRQs exact.
 ----------------------------------------------------------------------
-Summary: 12 passed, 0 failed.
+Summary: 13 passed, 0 failed.
 ```
 
 ---

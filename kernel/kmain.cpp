@@ -10,6 +10,7 @@
 #include "mucore/core/init.hpp"
 #include "mucore/core/smp.hpp"
 #include "mucore/core/vmspace.hpp"
+#include "mucore/shell/cli.hpp"
 #include "mucore/shell/hal.hpp"
 #include "mucore/shell/shared_conduit.hpp"
 #include "kernel/arch/x86_64/cpu.hpp"
@@ -136,6 +137,8 @@ inline void notify_remote_cpus_ipi(u64 cpu_mask) noexcept {
     if (cpu_idx < MAX_SMP_CPUS) {
         init_percpu_arch(g_percpu[cpu_idx], cpu_idx, info->lapic_id);
         load_idt_on_current_cpu(g_idt);
+        enable_x2apic_software(VEC_SPURIOUS);
+        init_x2apic_tsc_deadline(VEC_APIC_TIMER);
 
         __atomic_store_n(&g_smp.shards[cpu_idx].online, true, __ATOMIC_RELEASE);
         (void)__atomic_fetch_add(&g_online_cpu_count, 1u, __ATOMIC_ACQ_REL);
@@ -490,6 +493,17 @@ extern "C" void mucore_irq_vector_c(
             }
         }
         wrmsr(MSR_X2APIC_EOI, 0ULL);
+    } else if (vector >= VEC_DEVICE_IRQ_BASE && vector < (VEC_DEVICE_IRQ_BASE + VEC_DEVICE_IRQ_COUNT)) {
+        // Hardware Device Interrupt (MSI/MSI-X/PCIe/IOAPIC) -> Dispatches to Ring-0 Kineticlet DAG!
+        u16 const irq_line = static_cast<u16>(vector);
+        u64 const hw_status = 0x0001ULL; // In production read from device MMIO/BAR register
+        (void)g_kernel.handle_event(core::KernelEvent{
+            .kind            = core::EventKind::HardwareIrq,
+            .timestamp       = now,
+            .irq_line        = IrqLine{irq_line},
+            .irq_status_word = hw_status,
+        });
+        wrmsr(MSR_X2APIC_EOI, 0ULL);
     }
     // Spurious vector 255 intentionally omits EOI per Intel SDM Vol. 3A 10.9.
 }
@@ -512,10 +526,19 @@ extern "C" [[noreturn]] void kmain() noexcept {
     build_shared_idt(g_idt);
     init_percpu_arch(g_percpu[0], 0u, bsp_lapic);
     load_idt_on_current_cpu(g_idt);
+    enable_x2apic_software(VEC_SPURIOUS);
+    init_x2apic_tsc_deadline(VEC_APIC_TIMER);
 
     __atomic_store_n(&g_smp.shards[0].online, true, __ATOMIC_RELEASE);
     __atomic_store_n(&g_online_cpu_count, 1u, __ATOMIC_RELEASE);
+
+    TscClockScale const tsc_scale = calibrate_tsc();
     SerialCom1::puts("[mucore] Core 0 %gs Per-CPU GDT/TSS, 256-gate IDT & SYSCALL armed.\n");
+    SerialCom1::puts("[mucore] Calibrated TSC clock: ");
+    SerialCom1::write_u64(tsc_scale.tsc_hz / 1'000'000ULL);
+    SerialCom1::puts(" MHz (Fixed-Point Mult=");
+    SerialCom1::write_u64(tsc_scale.mult);
+    SerialCom1::puts(" >> 20)\n");
 
     if (g_hhdm_req.response != nullptr) {
         SerialCom1::puts("[mucore] Limine HHDM Offset: ");
@@ -554,9 +577,9 @@ extern "C" [[noreturn]] void kmain() noexcept {
     run_boot_post(boot_time);
 
     g_hal.set_hardware_live(true);
-    SerialCom1::puts("[mucore] Entering tickless multi-core Imperative Shell loop.\n");
+    SerialCom1::puts("[mucore] Entering interactive serial shell REPL on COM1.\n");
 
-    for (;;) {
-        asm volatile("sti; hlt");
-    }
+    asm volatile("sti");
+    shell::CommandShell<X86Hal> cmd_shell{g_kernel, g_init, boot::PLAN, &g_smp};
+    cmd_shell.run_serial_repl<SerialCom1>();
 }
